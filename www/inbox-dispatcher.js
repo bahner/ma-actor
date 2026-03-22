@@ -1,0 +1,168 @@
+export function contentTypeToRouteKey(contentType) {
+  const value = String(contentType || '').trim();
+  if (value === 'application/x-ma-chat' || value === 'application/x.ma.chat') {
+    return 'application/x-ma-chat';
+  }
+  if (value === 'application/x-ma-whisper' || value === 'application/x.ma.whisper') {
+    return 'application/x-ma-whisper';
+  }
+  return '';
+}
+
+export function createInboundDispatcher(deps) {
+  const {
+    state,
+    logger,
+    appendMessage,
+    displayActor,
+    humanizeText,
+    fetchDidDocumentJsonByDid,
+    decodeChatEventMessage,
+    decodeWhisperEventMessage,
+    didRoot
+  } = deps;
+
+  function inferInboundMimeType(kind) {
+    if (kind === 'chat') return 'application/x-ma-chat';
+    if (kind === 'whisper') return 'application/x-ma-whisper';
+    return '';
+  }
+
+  function normalizeInboundEvent(event) {
+    if (!event || typeof event !== 'object') {
+      return null;
+    }
+    return {
+      kind: String(event.kind || 'default'),
+      mimeType: String(event.mime_type || '').trim() || inferInboundMimeType(String(event.kind || 'default')),
+      senderHandle: event.sender || '',
+      senderDid: event.sender_did || '',
+      senderEndpoint: event.sender_endpoint || '',
+      text: event.message || '',
+      messageCborB64: event.message_cbor_b64 || ''
+    };
+  }
+
+  function shouldSuppressInboundEcho(evt) {
+    return Boolean(
+      (evt.kind === 'speech' || evt.kind === 'chat') &&
+        evt.senderHandle &&
+        state.aliasName &&
+        evt.senderHandle === state.aliasName
+    );
+  }
+
+  function writeDialogChat(senderDid, senderHandle, text) {
+    const actor = displayActor(senderDid, senderHandle);
+    appendMessage('world', humanizeText(`${actor}: ${text}`));
+  }
+
+  function writeDialogWhisper(senderDid, senderHandle, text) {
+    const actor = displayActor(senderDid, senderHandle);
+    appendMessage('world', humanizeText(`${actor} whispers ${text}.`));
+  }
+
+  function writeDialogSystem(text) {
+    appendMessage('system', humanizeText(text));
+  }
+
+  function writeDialogWorld(text) {
+    appendMessage('world', humanizeText(text));
+  }
+
+  function logInboundDispatch(evt, routeName) {
+    const incomingType = evt.mimeType || `event/${evt.kind}`;
+    const sender = evt.senderDid || evt.senderHandle || 'unknown';
+    logger.log('inbox.dispatch', `received ${incomingType} message from ${sender} sent to ${routeName} handler`);
+  }
+
+  async function handleInboundChat(evt) {
+    if (!evt.messageCborB64) {
+      return;
+    }
+    const senderDid = evt.senderDid;
+    if (!senderDid) {
+      throw new Error('missing sender DID for chat');
+    }
+    const senderDoc = await fetchDidDocumentJsonByDid(senderDid);
+    const text = decodeChatEventMessage(senderDoc, evt.messageCborB64);
+    writeDialogChat(evt.senderDid, evt.senderHandle, text);
+  }
+
+  async function handleInboundWhisper(evt) {
+    if (!evt.messageCborB64) {
+      return;
+    }
+    const senderDid = evt.senderDid;
+    if (!senderDid) {
+      throw new Error('missing sender DID for whisper');
+    }
+    const senderDoc = await fetchDidDocumentJsonByDid(senderDid);
+    const text = decodeWhisperEventMessage(
+      state.passphrase,
+      state.encryptedBundle,
+      senderDoc,
+      evt.messageCborB64
+    );
+    writeDialogWhisper(senderDid, evt.senderHandle, text);
+  }
+
+  async function handleInboundSystem(evt) {
+    if (!evt.text) return;
+    writeDialogSystem(evt.text);
+  }
+
+  async function handleInboundSpeech(evt) {
+    if (!evt.text) return;
+    writeDialogWorld(evt.text);
+  }
+
+  async function handleInboundDefault(evt) {
+    if (!evt.text) return;
+    writeDialogWorld(evt.text);
+  }
+
+  const inboundRoutes = {
+    'application/x-ma-chat': { name: 'chat', handler: handleInboundChat },
+    'application/x-ma-whisper': { name: 'whisper', handler: handleInboundWhisper },
+    'event/system': { name: 'system', handler: handleInboundSystem },
+    'event/speech': { name: 'speech', handler: handleInboundSpeech },
+    'event/default': { name: 'default', handler: handleInboundDefault }
+  };
+
+  async function dispatchInboundEvent(event) {
+    const evt = normalizeInboundEvent(event);
+    if (!evt) {
+      return;
+    }
+
+    if (!evt.text && !evt.messageCborB64) {
+      return;
+    }
+
+    if (evt.senderHandle && evt.senderDid) {
+      state.handleDidMap[evt.senderHandle] = evt.senderDid;
+    }
+    if (evt.senderDid && evt.senderEndpoint) {
+      state.didEndpointMap[didRoot(evt.senderDid)] = evt.senderEndpoint;
+    }
+
+    if (shouldSuppressInboundEcho(evt)) {
+      return;
+    }
+
+    const routeKey = evt.mimeType || `event/${evt.kind}`;
+    const route = inboundRoutes[routeKey] || inboundRoutes['event/default'];
+    logInboundDispatch(evt, route.name);
+
+    try {
+      await route.handler(evt);
+    } catch (error) {
+      writeDialogSystem(`Failed to process inbound message: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
+
+  return {
+    dispatchInboundEvent
+  };
+}

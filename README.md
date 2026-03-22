@@ -35,11 +35,18 @@ It creates/unlocks local encrypted identity bundles, publishes DID documents to 
 ```bash
 make build
 make serve
+make publish-ipfs
 ```
 
 The app is served on:
 
 - `http://127.0.0.1:8081`
+
+The build can also be published to IPFS as a static artifact:
+
+- `make publish-ipfs`
+- Prints the root CID plus local and public gateway URLs for the built `www/` directory
+- Intended for distribution and archival; local serving remains the recommended runtime origin
 
 ## Cleanup
 
@@ -53,15 +60,40 @@ make distclean
 - `/help`
 - `/identity`
 - `/alias <name> <address>`
+- `alias <name> <address>`
 - `/unalias <name>`
 - `/aliases`
+- `/enter <iroh:...|alias>`
 - `/publish` (publishes DID document to IPNS)
+
+## Home Entry Over Iroh
+
+You can save a world alias using an advertised Iroh endpoint id and then enter it:
+
+```text
+alias home iroh:bf19268b811bbee577021f97f90d08bd752921c1f7d98a3b00a9900a261790bc
+/enter home
+```
+
+Current behavior:
+
+- The browser WASM client uses `iroh` directly
+- `/enter` accepts either a literal `iroh:` endpoint id or an alias to one
+- The client opens an Iroh connection to `ma-home` over the home protocol ALPN
+- Plain chat text after `/enter` is sent to the current home and room
+- Room chatter is fanned out by `ma-home` and polled by each actor, so all connected actors in the room receive the same speech events
+
+The localhost status page in `ma-home` is still useful for inspection, but it is no longer the transport path for `/enter`.
 
 ## Identity and Publish Model
 
 - Encrypted bundle is local/private (browser storage + export file)
 - DID document is public and publishable
 - `/publish` uploads DID document JSON to IPFS and updates IPNS record
+- Browser storage is namespaced per alias, so one browser profile can keep multiple local actors
+- The currently active alias is remembered per browser tab, which allows concurrent actors in separate tabs/windows on the same origin
+- The actor locale is configurable per alias; localized `@` aliases are mapped to canonical protocol targets before sending
+- The published DID document carries the preferred locale in `ma:locale` using canonical locale tags such as `en` and `nb-NO`
 
 ## Kubo CORS
 
@@ -72,4 +104,7 @@ If `/publish` or Kubo check fails in-browser, verify:
 1. Kubo daemon is running
 2. API endpoint is correct
 3. CORS origins include your host/port
+
+Local serving on `http://127.0.0.1:8081` remains the recommended runtime origin.
+Use `make publish-ipfs` for distribution and archival, not as the primary runtime origin.
 

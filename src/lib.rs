@@ -7,7 +7,10 @@ use chacha20poly1305::{
     Key, XChaCha20Poly1305, XNonce,
 };
 use did_ma::{Did, Document, EncryptionKey, SigningKey, VerificationMethod};
+use iroh::{Endpoint, EndpointId, endpoint::presets};
+use ma_actor_core::{canonical_locale, parse_message_with_locale};
 use serde::{Deserialize, Serialize};
+use tokio::io::AsyncWriteExt;
 use wasm_bindgen::prelude::*;
 
 // ── Data structures ────────────────────────────────────────────────────────────
@@ -45,6 +48,68 @@ struct UnlockResult {
     ipns: String,
     document_json: String,
 }
+
+#[derive(Serialize)]
+struct UpdateResult {
+    encrypted_bundle: String,
+    did: String,
+    ipns: String,
+    document_json: String,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum WorldRequest {
+    Enter {
+        actor_name: String,
+        did: String,
+        room: Option<String>,
+    },
+    Message {
+        actor_name: String,
+        did: String,
+        room: String,
+        envelope: ma_actor_core::MessageEnvelope,
+    },
+    RoomEvents {
+        room: String,
+        since_sequence: u64,
+    },
+}
+
+#[derive(Serialize, Deserialize)]
+struct RoomEvent {
+    sequence: u64,
+    room: String,
+    kind: String,
+    sender: Option<String>,
+    message: String,
+    occurred_at: String,
+}
+
+#[derive(Serialize, Deserialize)]
+struct WorldResponse {
+    ok: bool,
+    room: String,
+    message: String,
+    endpoint_id: String,
+    latest_event_sequence: u64,
+    broadcasted: bool,
+    events: Vec<RoomEvent>,
+}
+
+#[derive(Serialize)]
+struct WorldActionResult {
+    ok: bool,
+    room: String,
+    message: String,
+    endpoint_id: String,
+    latest_event_sequence: u64,
+    broadcasted: bool,
+    events: Vec<RoomEvent>,
+}
+
+const WORLD_ALPN: &[u8] = b"ma/world/1";
 
 #[derive(Serialize)]
 struct IpnsPointer {
@@ -126,6 +191,96 @@ fn decrypt_bundle(passphrase: &str, bundle: &EncryptedIdentityBundle) -> Result<
     cipher
         .decrypt(nonce, ciphertext.as_slice())
         .map_err(|_| "wrong passphrase or corrupted bundle".to_string())
+}
+
+async fn send_world_request(endpoint_id: &str, request: WorldRequest) -> Result<WorldResponse, JsValue> {
+    let endpoint_id: EndpointId = endpoint_id
+        .trim()
+        .parse()
+        .map_err(|e| js_err(format!("invalid iroh endpoint id: {e}")))?;
+
+    let endpoint = Endpoint::builder(presets::N0)
+        .bind()
+        .await
+        .map_err(js_err)?;
+
+    let connection = endpoint
+        .connect(endpoint_id, WORLD_ALPN)
+        .await
+        .map_err(|e| js_err(format!("iroh connect failed: {e}")))?;
+    let (mut send, mut recv) = connection
+        .open_bi()
+        .await
+        .map_err(|e| js_err(format!("iroh stream open failed: {e}")))?;
+
+    let payload = serde_json::to_vec(&request).map_err(js_err)?;
+    send.write_all(&payload)
+        .await
+        .map_err(|e| js_err(format!("iroh send failed: {e}")))?;
+    send.flush()
+        .await
+        .map_err(|e| js_err(format!("iroh flush failed: {e}")))?;
+    send.finish().map_err(js_err)?;
+
+    let response_bytes = recv
+        .read_to_end(64 * 1024)
+        .await
+        .map_err(|e| js_err(format!("iroh read failed: {e}")))?;
+    let response: WorldResponse = serde_json::from_slice(&response_bytes).map_err(js_err)?;
+
+    connection.close(0u32.into(), b"ok");
+    endpoint.close().await;
+
+    Ok(response)
+}
+
+fn restore_signing_key(ipns: &str, private_key_hex: &str) -> Result<SigningKey, JsValue> {
+    let sign_did = Did::new(ipns, "sig").map_err(js_err)?;
+    let private_key_vec = hex::decode(private_key_hex).map_err(js_err)?;
+    let private_key: [u8; 32] = private_key_vec
+        .try_into()
+        .map_err(|_| js_err("invalid signing private key length"))?;
+
+    SigningKey::from_private_key_bytes(sign_did, private_key).map_err(js_err)
+}
+
+fn update_bundle_document<F>(
+    passphrase: &str,
+    encrypted_bundle_json: &str,
+    update: F,
+) -> Result<String, JsValue>
+where
+    F: FnOnce(&mut Document) -> Result<(), JsValue>,
+{
+    let encrypted: EncryptedIdentityBundle = serde_json::from_str(encrypted_bundle_json)
+        .map_err(|e| js_err(format!("invalid bundle JSON: {e}")))?;
+
+    let plain_bytes = decrypt_bundle(passphrase, &encrypted).map_err(js_err)?;
+    let mut plain: IdentityBundlePlain = serde_json::from_slice(&plain_bytes)
+        .map_err(|e| js_err(format!("bundle corrupted: {e}")))?;
+
+    update(&mut plain.document)?;
+
+    let signing_key = restore_signing_key(&plain.ipns, &plain.signing_private_key_hex)?;
+    let assertion_method = plain
+        .document
+        .get_verification_method_by_id(&plain.document.assertion_method)
+        .map_err(js_err)?
+        .clone();
+    plain.document.sign(&signing_key, &assertion_method).map_err(js_err)?;
+
+    let document_json = plain.document.marshal().map_err(js_err)?;
+    let plain_json = serde_json::to_string(&plain).map_err(js_err)?;
+    let encrypted = encrypt_bundle(passphrase, plain_json.as_bytes()).map_err(js_err)?;
+
+    let result = UpdateResult {
+        encrypted_bundle: serde_json::to_string(&encrypted).map_err(js_err)?,
+        did: plain.document.id.clone(),
+        ipns: plain.ipns,
+        document_json,
+    };
+
+    serde_json::to_string(&result).map_err(js_err)
 }
 
 // ── Exported WASM functions ────────────────────────────────────────────────────
@@ -226,6 +381,154 @@ pub fn unlock_identity(passphrase: &str, encrypted_bundle_json: &str) -> Result<
     };
 
     serde_json::to_string(&result).map_err(js_err)
+}
+
+/// Update the optional `ma:presenceHint` field in the DID document and re-sign it.
+/// Returns JSON: `{ encrypted_bundle, did, ipns, document_json }`
+#[wasm_bindgen]
+pub fn set_bundle_presence_hint(
+    passphrase: &str,
+    encrypted_bundle_json: &str,
+    hint: &str,
+) -> Result<String, JsValue> {
+    update_bundle_document(passphrase, encrypted_bundle_json, |document| {
+        document.set_presence_hint(hint).map_err(js_err)
+    })
+}
+
+/// Update the optional `ma:locale` field in the DID document and re-sign it.
+/// Returns JSON: `{ encrypted_bundle, did, ipns, document_json }`
+#[wasm_bindgen]
+pub fn set_bundle_locale(
+    passphrase: &str,
+    encrypted_bundle_json: &str,
+    locale: &str,
+) -> Result<String, JsValue> {
+    update_bundle_document(passphrase, encrypted_bundle_json, |document| {
+        document.set_locale(canonical_locale(locale)).map_err(js_err)
+    })
+}
+
+/// Remove the optional `ma:locale` field from the DID document and re-sign it.
+/// Returns JSON: `{ encrypted_bundle, did, ipns, document_json }`
+#[wasm_bindgen]
+pub fn clear_bundle_locale(
+    passphrase: &str,
+    encrypted_bundle_json: &str,
+) -> Result<String, JsValue> {
+    update_bundle_document(passphrase, encrypted_bundle_json, |document| {
+        document.clear_locale();
+        Ok(())
+    })
+}
+
+/// Remove the optional `ma:presenceHint` field from the DID document and re-sign it.
+/// Returns JSON: `{ encrypted_bundle, did, ipns, document_json }`
+#[wasm_bindgen]
+pub fn clear_bundle_presence_hint(
+    passphrase: &str,
+    encrypted_bundle_json: &str,
+) -> Result<String, JsValue> {
+    update_bundle_document(passphrase, encrypted_bundle_json, |document| {
+        document.clear_presence_hint();
+        Ok(())
+    })
+}
+
+/// Enter a world over iroh using the world protocol.
+#[wasm_bindgen]
+pub async fn enter_world(
+    endpoint_id: &str,
+    actor_name: &str,
+    did: &str,
+    room: &str,
+) -> Result<String, JsValue> {
+    let room = room.trim();
+    let response = send_world_request(
+        endpoint_id,
+        WorldRequest::Enter {
+            actor_name: actor_name.trim().to_string(),
+            did: did.trim().to_string(),
+            room: if room.is_empty() {
+                None
+            } else {
+                Some(room.to_string())
+            },
+        },
+    )
+    .await?;
+
+    serde_json::to_string(&WorldActionResult {
+        ok: response.ok,
+        room: response.room,
+        message: response.message,
+        endpoint_id: response.endpoint_id,
+        latest_event_sequence: response.latest_event_sequence,
+        broadcasted: response.broadcasted,
+        events: response.events,
+    })
+    .map_err(js_err)
+}
+
+/// Send a room message over iroh using the world protocol.
+#[wasm_bindgen]
+pub async fn send_world_message(
+    endpoint_id: &str,
+    actor_name: &str,
+    did: &str,
+    room: &str,
+    locale: &str,
+    text: &str,
+) -> Result<String, JsValue> {
+    let response = send_world_request(
+        endpoint_id,
+        WorldRequest::Message {
+            actor_name: actor_name.trim().to_string(),
+            did: did.trim().to_string(),
+            room: room.trim().to_string(),
+            envelope: parse_message_with_locale(text, canonical_locale(locale)),
+        },
+    )
+    .await?;
+
+    serde_json::to_string(&WorldActionResult {
+        ok: response.ok,
+        room: response.room,
+        message: response.message,
+        endpoint_id: response.endpoint_id,
+        latest_event_sequence: response.latest_event_sequence,
+        broadcasted: response.broadcasted,
+        events: response.events,
+    })
+    .map_err(js_err)
+}
+
+/// Poll room events over iroh using the world protocol.
+#[wasm_bindgen]
+pub async fn poll_world_events(
+    endpoint_id: &str,
+    room: &str,
+    since_sequence: u64,
+) -> Result<String, JsValue> {
+    let response = send_world_request(
+        endpoint_id,
+        WorldRequest::RoomEvents {
+            room: room.trim().to_string(),
+            since_sequence,
+        },
+    )
+    .await?;
+
+    serde_json::to_string(&WorldActionResult {
+        ok: response.ok,
+        room: response.room,
+        message: response.message,
+        endpoint_id: response.endpoint_id,
+        latest_event_sequence: response.latest_event_sequence,
+        broadcasted: response.broadcasted,
+        events: response.events,
+    })
+    .map_err(js_err)
 }
 
 /// Build an IPNS pointer record (JSON) for publishing via Kubo or w3s.

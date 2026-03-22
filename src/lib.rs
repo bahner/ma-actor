@@ -2,18 +2,27 @@ use argon2::{Algorithm, Argon2, Params, Version};
 use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine;
 use bip39::{Language, Mnemonic};
+use blake3;
 use chacha20poly1305::{
     aead::{Aead, KeyInit},
     Key, XChaCha20Poly1305, XNonce,
 };
-use did_ma::{CONTENT_TYPE_COMMAND, Did, Document, EncryptionKey, Message, SigningKey, VerificationMethod};
+use did_ma::{
+    CONTENT_TYPE_CHAT, CONTENT_TYPE_COMMAND, CONTENT_TYPE_WHISPER,
+    Did, Document, EncryptionKey, Message, SigningKey, VerificationMethod,
+};
 use iroh::{
     Endpoint, EndpointAddr, EndpointId, RelayUrl,
     endpoint::{Connection, RecvStream, SendStream, presets},
+    protocol::{AcceptError, ProtocolHandler, Router},
 };
 use js_sys;
 use std::cell::RefCell;
+use std::collections::{HashMap, VecDeque};
+use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::sync::RwLock;
+use x25519_dalek::{PublicKey as X25519PublicKey, StaticSecret};
 
 const DEFAULT_WORLD_RELAY_URL: &str = "https://euc1-1.relay.n0.iroh-canary.iroh.link";
 
@@ -50,6 +59,106 @@ fn store_conn_cache(cache: WorldConnCache) {
 
 fn clear_conn_cache() {
     CONN_CACHE.with(|c| *c.borrow_mut() = None);
+}
+
+fn with_inbox_state<T>(f: impl FnOnce(&Option<InboxListenerState>) -> T) -> T {
+    INBOX_STATE.with(|slot| {
+        let state_ref = slot.borrow();
+        f(&state_ref)
+    })
+}
+
+fn set_inbox_state(state: InboxListenerState) {
+    INBOX_STATE.with(|slot| {
+        *slot.borrow_mut() = Some(state);
+    });
+}
+
+impl ProtocolHandler for InboxProtocol {
+    async fn accept(&self, connection: Connection) -> Result<(), AcceptError> {
+        let from_endpoint = connection.remote_id().to_string();
+        let (mut send, mut recv) = connection.accept_bi().await?;
+
+        loop {
+            let frame_len = match recv.read_u32().await {
+                Ok(n) => n as usize,
+                Err(err) if err.kind() == std::io::ErrorKind::UnexpectedEof => break,
+                Err(err) => return Err(AcceptError::from_err(err)),
+            };
+
+            if frame_len > 256 * 1024 {
+                return Err(AcceptError::from_err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("inbox frame too large: {}", frame_len),
+                )));
+            }
+
+            let mut bytes = vec![0u8; frame_len];
+            recv.read_exact(&mut bytes).await.map_err(AcceptError::from_err)?;
+
+            let response = match serde_json::from_slice::<InboxRequest>(&bytes) {
+                Ok(InboxRequest::Signed { message_cbor }) => {
+                    let item = InboxMessage {
+                        message_cbor_b64: B64.encode(message_cbor),
+                        from_endpoint: from_endpoint.clone(),
+                        received_at: now_unix_secs(),
+                    };
+                    let mut queue = self.queue.write().await;
+                    if queue.len() >= MAX_INBOX_EVENTS {
+                        queue.pop_front();
+                    }
+                    queue.push_back(item);
+                    InboxResponse {
+                        ok: true,
+                        message: "queued".to_string(),
+                    }
+                }
+                Err(err) => InboxResponse {
+                    ok: false,
+                    message: format!("invalid inbox request JSON: {}", err),
+                },
+            };
+
+            let payload = serde_json::to_vec(&response).map_err(AcceptError::from_err)?;
+            send.write_u32(payload.len() as u32)
+                .await
+                .map_err(AcceptError::from_err)?;
+            send.write_all(&payload).await.map_err(AcceptError::from_err)?;
+            send.flush().await.map_err(AcceptError::from_err)?;
+        }
+
+        let _ = send.finish();
+        Ok(())
+    }
+}
+
+async fn ensure_inbox_listener() -> Result<String, JsValue> {
+    if let Some(existing_id) = with_inbox_state(|state| state.as_ref().map(|s| s.endpoint.id().to_string())) {
+        return Ok(existing_id);
+    }
+
+    let endpoint = Endpoint::builder(presets::N0)
+        .bind()
+        .await
+        .map_err(|e| js_err(format!("inbox endpoint bind failed: {e}")))?;
+
+    let queue = Arc::new(RwLock::new(VecDeque::with_capacity(MAX_INBOX_EVENTS)));
+    let protocol = InboxProtocol {
+        queue: queue.clone(),
+    };
+
+    let router = Router::builder(endpoint.clone())
+        .accept(HOME_INBOX_ALPN, protocol)
+        .spawn();
+
+    let endpoint_id = endpoint.id().to_string();
+    set_inbox_state(InboxListenerState {
+        endpoint,
+        router,
+        queue,
+    });
+
+    Ok(endpoint_id)
 }
 
 async fn create_stream_cache(target_id_str: &str, relay_hint: Option<&str>) -> Result<WorldConnCache, JsValue> {
@@ -147,7 +256,17 @@ async fn exchange_on_stream(cache: &mut WorldConnCache, request: &WorldRequest) 
 
     serde_json::from_slice(&response_bytes).map_err(js_err)
 }
-use ma_actor_core::{canonical_locale, parse_message_with_locale};
+use ma_actor_core::{
+    canonical_locale,
+    did_root as core_did_root,
+    find_alias_for_address as core_find_alias_for_address,
+    find_did_by_endpoint as core_find_did_by_endpoint,
+    humanize_identifier as core_humanize_identifier,
+    humanize_text as core_humanize_text,
+    normalize_endpoint_id as core_normalize_endpoint_id,
+    parse_message_with_locale,
+    resolve_alias_input as core_resolve_alias_input,
+};
 use serde::{Deserialize, Serialize};
 use wasm_bindgen::prelude::*;
 
@@ -199,12 +318,14 @@ struct UpdateResult {
 #[serde(tag = "kind", rename_all = "snake_case")]
 enum WorldRequest {
     Signed { message_cbor: Vec<u8> },
+    Chat { room: String, message_cbor: Vec<u8> },
+    Whisper { message_cbor: Vec<u8> },
 }
 
 #[derive(Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 enum WorldCommand {
-    Enter { room: Option<String> },
+    Enter { room: Option<String>, preferred_handle: Option<String> },
     Message {
         room: String,
         envelope: ma_actor_core::MessageEnvelope,
@@ -221,7 +342,13 @@ struct RoomEvent {
     room: String,
     kind: String,
     sender: Option<String>,
+    #[serde(default)]
+    sender_did: Option<String>,
+    #[serde(default)]
+    sender_endpoint: Option<String>,
     message: String,
+    #[serde(default)]
+    message_cbor_b64: Option<String>,
     occurred_at: String,
 }
 
@@ -234,6 +361,10 @@ struct WorldResponse {
     latest_event_sequence: u64,
     broadcasted: bool,
     events: Vec<RoomEvent>,
+    #[serde(default)]
+    handle: String,
+    #[serde(default)]
+    pending_whispers: Vec<RoomEvent>,
 }
 
 #[derive(Serialize)]
@@ -245,10 +376,57 @@ struct WorldActionResult {
     latest_event_sequence: u64,
     broadcasted: bool,
     events: Vec<RoomEvent>,
+    #[serde(default)]
+    handle: String,
+    #[serde(default)]
+    pending_whispers: Vec<RoomEvent>,
 }
 
 const WORLD_ALPN: &[u8] = b"ma/world/1";
+const HOME_INBOX_ALPN: &[u8] = b"ma/home/inbox/1";
 const WORLD_TARGET_DID: &str = "did:ma:world";
+const MAX_INBOX_EVENTS: usize = 256;
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct InboxMessage {
+    message_cbor_b64: String,
+    from_endpoint: String,
+    received_at: u64,
+}
+
+#[derive(Serialize)]
+struct InboxPollResult {
+    endpoint_id: String,
+    messages: Vec<InboxMessage>,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum InboxRequest {
+    Signed { message_cbor: Vec<u8> },
+}
+
+#[derive(Serialize, Deserialize)]
+struct InboxResponse {
+    ok: bool,
+    message: String,
+}
+
+#[derive(Clone, Debug)]
+struct InboxProtocol {
+    queue: Arc<RwLock<VecDeque<InboxMessage>>>,
+}
+
+#[derive(Debug)]
+struct InboxListenerState {
+    endpoint: Endpoint,
+    router: Router,
+    queue: Arc<RwLock<VecDeque<InboxMessage>>>,
+}
+
+thread_local! {
+    static INBOX_STATE: RefCell<Option<InboxListenerState>> = RefCell::new(None);
+}
 
 #[derive(Serialize)]
 struct IpnsPointer {
@@ -290,6 +468,15 @@ fn normalize_phrase_text(input: &str) -> String {
         .filter(|part| !part.is_empty())
         .collect::<Vec<_>>()
         .join(" ")
+}
+
+fn parse_string_map(map_json: &str) -> Result<HashMap<String, String>, JsValue> {
+    let trimmed = map_json.trim();
+    if trimmed.is_empty() {
+        return Ok(HashMap::new());
+    }
+    serde_json::from_str::<HashMap<String, String>>(trimmed)
+        .map_err(|e| js_err(format!("invalid map JSON: {e}")))
 }
 
 // ── Crypto ─────────────────────────────────────────────────────────────────────
@@ -360,6 +547,109 @@ pub async fn disconnect_world() {
         cached.connection.close(0u32.into(), b"bye");
         cached.endpoint.close().await;
     }
+
+    let state = INBOX_STATE.with(|slot| slot.borrow_mut().take());
+    if let Some(listener) = state {
+        let _ = listener.router.shutdown().await;
+        listener.endpoint.close().await;
+    }
+}
+
+/// Ensure a direct inbox listener is running for this ma-home session.
+/// Returns local inbox endpoint id.
+#[wasm_bindgen]
+pub async fn start_inbox_listener() -> Result<String, JsValue> {
+    ensure_inbox_listener().await
+}
+
+/// Poll and drain direct inbox messages received over iroh.
+#[wasm_bindgen]
+pub async fn poll_inbox_messages() -> Result<String, JsValue> {
+    let Some((endpoint_id, queue)) = with_inbox_state(|state| {
+        state
+            .as_ref()
+            .map(|s| (s.endpoint.id().to_string(), s.queue.clone()))
+    }) else {
+        return Ok(serde_json::to_string(&InboxPollResult {
+            endpoint_id: String::new(),
+            messages: Vec::new(),
+        })
+        .map_err(js_err)?);
+    };
+
+    let mut guard = queue.write().await;
+    let messages = guard.drain(..).collect::<Vec<_>>();
+    drop(guard);
+
+    serde_json::to_string(&InboxPollResult {
+        endpoint_id,
+        messages,
+    })
+    .map_err(js_err)
+}
+
+/// Inspect a signed message CBOR (base64) and return minimal metadata.
+#[wasm_bindgen]
+pub fn inspect_signed_message(message_cbor_b64: &str) -> Result<String, JsValue> {
+    let cbor = B64.decode(message_cbor_b64).map_err(js_err)?;
+    let message = Message::from_cbor(&cbor).map_err(js_err)?;
+
+    #[derive(Serialize)]
+    struct MessageMeta {
+        from: String,
+        to: String,
+        content_type: String,
+    }
+
+    serde_json::to_string(&MessageMeta {
+        from: message.from,
+        to: message.to,
+        content_type: message.content_type,
+    })
+    .map_err(js_err)
+}
+
+#[wasm_bindgen]
+pub fn alias_did_root(input: &str) -> String {
+    core_did_root(input)
+}
+
+#[wasm_bindgen]
+pub fn alias_normalize_endpoint_id(input: &str) -> String {
+    core_normalize_endpoint_id(input).unwrap_or_default()
+}
+
+#[wasm_bindgen]
+pub fn alias_resolve_input(input: &str, alias_book_json: &str) -> Result<String, JsValue> {
+    let alias_book = parse_string_map(alias_book_json)?;
+    Ok(core_resolve_alias_input(input, &alias_book))
+}
+
+#[wasm_bindgen]
+pub fn alias_find_alias_for_address(address: &str, alias_book_json: &str) -> Result<String, JsValue> {
+    let alias_book = parse_string_map(alias_book_json)?;
+    Ok(core_find_alias_for_address(address, &alias_book).unwrap_or_default())
+}
+
+#[wasm_bindgen]
+pub fn alias_find_did_by_endpoint(
+    endpoint_like: &str,
+    did_endpoint_map_json: &str,
+) -> Result<String, JsValue> {
+    let did_endpoint_map = parse_string_map(did_endpoint_map_json)?;
+    Ok(core_find_did_by_endpoint(endpoint_like, &did_endpoint_map).unwrap_or_default())
+}
+
+#[wasm_bindgen]
+pub fn alias_humanize_identifier(value: &str, alias_book_json: &str) -> Result<String, JsValue> {
+    let alias_book = parse_string_map(alias_book_json)?;
+    Ok(core_humanize_identifier(value, &alias_book))
+}
+
+#[wasm_bindgen]
+pub fn alias_humanize_text(text: &str, alias_book_json: &str) -> Result<String, JsValue> {
+    let alias_book = parse_string_map(alias_book_json)?;
+    Ok(core_humanize_text(text, &alias_book))
 }
 
 fn build_signed_world_request(
@@ -383,33 +673,48 @@ fn build_signed_world_request(
     let from_did = Did::try_from(plain.document.id.as_str())
         .and_then(|did| did.with_fragment(actor_name))
         .map_err(js_err)?;
-use did_ma::msg::message_type;
 
     let signing_key = restore_signing_key(&plain.ipns, &plain.signing_private_key_hex)?;
     let content = serde_json::to_vec(&command).map_err(js_err)?;
     
     // Create message with custom timestamp from JavaScript (in milliseconds, convert to seconds)
-    let timestamp_secs = timestamp_ms / 1000;
-    let mut message = Message {
-        id: format!("{}", timestamp_ms), // Simple deterministic ID based on timestamp
-        message_type: message_type(),
-        from: from_did.id().to_string(),
-        to: WORLD_TARGET_DID.to_string(),
-        created_at: timestamp_secs,
-        content_type: CONTENT_TYPE_COMMAND.to_string(),
+    let message = build_signed_message_with_js_time(
+        from_did.id().to_string(),
+        WORLD_TARGET_DID.to_string(),
+        CONTENT_TYPE_COMMAND.to_string(),
         content,
-        signature: Vec::new(),
-    };
-
-    // Sign the message
-    message.sign(&signing_key)
-        .map_err(|e| js_err(format!("message signing failed: {}", e)))?;
-    message.sign(&signing_key)
-        .map_err(|e| js_err(format!("message signing failed: {}", e)))?;
+        &signing_key,
+        timestamp_ms,
+    )?;
 
     Ok(WorldRequest::Signed {
         message_cbor: message.to_cbor().map_err(js_err)?,
     })
+}
+
+fn build_signed_message_with_js_time(
+    from: String,
+    to: String,
+    content_type: String,
+    content: Vec<u8>,
+    signing_key: &SigningKey,
+    timestamp_ms: u64,
+) -> Result<Message, JsValue> {
+    let timestamp_secs = timestamp_ms / 1000;
+    let mut message = Message {
+        id: timestamp_ms.to_string(),
+        message_type: did_ma::msg::message_type(),
+        from,
+        to,
+        created_at: timestamp_secs,
+        content_type,
+        content,
+        signature: Vec::new(),
+    };
+    message
+        .sign(signing_key)
+        .map_err(|e| js_err(format!("message signing failed: {}", e)))?;
+    Ok(message)
 }
 
 fn restore_signing_key(ipns: &str, private_key_hex: &str) -> Result<SigningKey, JsValue> {
@@ -420,6 +725,67 @@ fn restore_signing_key(ipns: &str, private_key_hex: &str) -> Result<SigningKey, 
         .map_err(|_| js_err("invalid signing private key length"))?;
 
     SigningKey::from_private_key_bytes(sign_did, private_key).map_err(js_err)
+}
+
+fn restore_encryption_key(ipns: &str, private_key_hex: &str) -> Result<EncryptionKey, JsValue> {
+    let enc_did = Did::new(ipns, "enc").map_err(js_err)?;
+    let private_key_vec = hex::decode(private_key_hex).map_err(js_err)?;
+    let private_key: [u8; 32] = private_key_vec
+        .try_into()
+        .map_err(|_| js_err("invalid encryption private key length"))?;
+
+    EncryptionKey::from_private_key_bytes(enc_did, private_key).map_err(js_err)
+}
+
+fn parse_signed_message_with_sender_document(sender_document_json: &str, message_cbor_b64: &str) -> Result<Message, JsValue> {
+    let sender_document = Document::unmarshal(sender_document_json).map_err(js_err)?;
+    let message_cbor = B64.decode(message_cbor_b64).map_err(js_err)?;
+    let message = Message::from_cbor(&message_cbor).map_err(js_err)?;
+    message.verify_with_document(&sender_document).map_err(js_err)?;
+    Ok(message)
+}
+
+fn derive_whisper_key(shared_secret: [u8; 32]) -> [u8; 32] {
+    let hash = blake3::Hasher::new()
+        .update(b"ma-whisper-content")
+        .update(&shared_secret)
+        .finalize();
+    *hash.as_bytes()
+}
+
+fn encrypt_whisper_content(plaintext: &[u8], sender_encryption_key: &EncryptionKey, recipient_document: &Document) -> Result<Vec<u8>, JsValue> {
+    let recipient_pub = X25519PublicKey::from(recipient_document.key_agreement_public_key_bytes().map_err(js_err)?);
+    let shared_secret = sender_encryption_key.shared_secret(&recipient_pub);
+    let key_bytes = derive_whisper_key(shared_secret);
+
+    let nonce_bytes = random_bytes::<24>().map_err(js_err)?;
+    let cipher = XChaCha20Poly1305::new(Key::from_slice(&key_bytes));
+    let nonce = XNonce::from_slice(&nonce_bytes);
+    let ciphertext = cipher.encrypt(nonce, plaintext).map_err(|e| js_err(format!("whisper encryption failed: {e}")))?;
+
+    // payload layout: nonce(24) || ciphertext
+    let mut out = Vec::with_capacity(24 + ciphertext.len());
+    out.extend_from_slice(&nonce_bytes);
+    out.extend_from_slice(&ciphertext);
+    Ok(out)
+}
+
+fn decrypt_whisper_payload(cipher_payload: &[u8], recipient_encryption_key: &EncryptionKey, sender_document: &Document) -> Result<Vec<u8>, JsValue> {
+    if cipher_payload.len() < 24 {
+        return Err(js_err("invalid whisper payload"));
+    }
+    let (nonce_bytes, ciphertext) = cipher_payload.split_at(24);
+
+    let sender_pub = X25519PublicKey::from(sender_document.key_agreement_public_key_bytes().map_err(js_err)?);
+    let recipient_secret = StaticSecret::from(recipient_encryption_key.private_key_bytes());
+    let shared_secret = recipient_secret.diffie_hellman(&sender_pub).to_bytes();
+    let key_bytes = derive_whisper_key(shared_secret);
+
+    let cipher = XChaCha20Poly1305::new(Key::from_slice(&key_bytes));
+    let nonce = XNonce::from_slice(nonce_bytes);
+    cipher
+        .decrypt(nonce, ciphertext)
+        .map_err(|_| js_err("failed to decrypt whisper payload"))
 }
 
 fn update_bundle_document<F>(
@@ -649,6 +1015,7 @@ pub async fn enter_world(
             } else {
                 Some(room.to_string())
             },
+            preferred_handle: Some(actor_name.trim().to_string()),
         },
         timestamp_ms,
     )?;
@@ -662,8 +1029,155 @@ pub async fn enter_world(
         latest_event_sequence: response.latest_event_sequence,
         broadcasted: response.broadcasted,
         events: response.events,
+        handle: response.handle,
+        pending_whispers: response.pending_whispers,
     })
     .map_err(js_err)
+}
+
+/// Send a signed `application/x-ma-chat` message to a room.
+#[wasm_bindgen]
+pub async fn send_world_chat(
+    endpoint_id: &str,
+    passphrase: &str,
+    encrypted_bundle_json: &str,
+    actor_name: &str,
+    room: &str,
+    text: &str,
+) -> Result<String, JsValue> {
+    let encrypted: EncryptedIdentityBundle = serde_json::from_str(encrypted_bundle_json)
+        .map_err(|e| js_err(format!("invalid bundle JSON: {e}")))?;
+    let plain_bytes = decrypt_bundle(passphrase, &encrypted).map_err(js_err)?;
+    let plain: IdentityBundlePlain = serde_json::from_slice(&plain_bytes)
+        .map_err(|e| js_err(format!("bundle corrupted: {e}")))?;
+
+    let actor_name = actor_name.trim();
+    let from_did = Did::try_from(plain.document.id.as_str())
+        .and_then(|did| did.with_fragment(actor_name))
+        .map_err(js_err)?;
+    let signing_key = restore_signing_key(&plain.ipns, &plain.signing_private_key_hex)?;
+
+    let timestamp_ms = js_sys::Date::now() as u64;
+    let message = build_signed_message_with_js_time(
+        from_did.id(),
+        WORLD_TARGET_DID.to_string(),
+        CONTENT_TYPE_CHAT.to_string(),
+        text.as_bytes().to_vec(),
+        &signing_key,
+        timestamp_ms,
+    )?;
+
+    let request = WorldRequest::Chat {
+        room: room.trim().to_string(),
+        message_cbor: message.to_cbor().map_err(js_err)?,
+    };
+    let response = send_world_request(endpoint_id, request).await?;
+
+    serde_json::to_string(&WorldActionResult {
+        ok: response.ok,
+        room: response.room,
+        message: response.message,
+        endpoint_id: response.endpoint_id,
+        latest_event_sequence: response.latest_event_sequence,
+        broadcasted: response.broadcasted,
+        events: response.events,
+        handle: response.handle,
+        pending_whispers: response.pending_whispers,
+    })
+    .map_err(js_err)
+}
+
+/// Send an E2E-encrypted `application/x-ma-whisper` to recipient DID.
+#[wasm_bindgen]
+pub async fn send_world_whisper(
+    endpoint_id: &str,
+    passphrase: &str,
+    encrypted_bundle_json: &str,
+    actor_name: &str,
+    recipient_document_json: &str,
+    text: &str,
+) -> Result<String, JsValue> {
+    let encrypted: EncryptedIdentityBundle = serde_json::from_str(encrypted_bundle_json)
+        .map_err(|e| js_err(format!("invalid bundle JSON: {e}")))?;
+    let plain_bytes = decrypt_bundle(passphrase, &encrypted).map_err(js_err)?;
+    let plain: IdentityBundlePlain = serde_json::from_slice(&plain_bytes)
+        .map_err(|e| js_err(format!("bundle corrupted: {e}")))?;
+
+    let recipient_document = Document::unmarshal(recipient_document_json).map_err(js_err)?;
+    let actor_name = actor_name.trim();
+    let from_did = Did::try_from(plain.document.id.as_str())
+        .and_then(|did| did.with_fragment(actor_name))
+        .map_err(js_err)?;
+
+    let signing_key = restore_signing_key(&plain.ipns, &plain.signing_private_key_hex)?;
+    let encryption_key = restore_encryption_key(&plain.ipns, &plain.encryption_private_key_hex)?;
+    let cipher_payload = encrypt_whisper_content(text.as_bytes(), &encryption_key, &recipient_document)?;
+
+    let timestamp_ms = js_sys::Date::now() as u64;
+    let message = build_signed_message_with_js_time(
+        from_did.id(),
+        recipient_document.id.clone(),
+        CONTENT_TYPE_WHISPER.to_string(),
+        cipher_payload,
+        &signing_key,
+        timestamp_ms,
+    )?;
+
+    let request = WorldRequest::Whisper {
+        message_cbor: message.to_cbor().map_err(js_err)?,
+    };
+    let response = send_world_request(endpoint_id, request).await?;
+
+    serde_json::to_string(&WorldActionResult {
+        ok: response.ok,
+        room: response.room,
+        message: response.message,
+        endpoint_id: response.endpoint_id,
+        latest_event_sequence: response.latest_event_sequence,
+        broadcasted: response.broadcasted,
+        events: response.events,
+        handle: response.handle,
+        pending_whispers: response.pending_whispers,
+    })
+    .map_err(js_err)
+}
+
+/// Decode a base64 CBOR message and return the plaintext chat content.
+#[wasm_bindgen]
+pub fn decode_chat_event_message(
+    sender_document_json: &str,
+    message_cbor_b64: &str,
+) -> Result<String, JsValue> {
+    let message = parse_signed_message_with_sender_document(sender_document_json, message_cbor_b64)?;
+    if message.content_type != CONTENT_TYPE_CHAT {
+        return Err(js_err(format!("expected application/x-ma-chat, got {}", message.content_type)));
+    }
+    String::from_utf8(message.content).map_err(js_err)
+}
+
+/// Decode a base64 CBOR whisper message and decrypt its content for current identity.
+#[wasm_bindgen]
+pub fn decode_whisper_event_message(
+    passphrase: &str,
+    encrypted_bundle_json: &str,
+    sender_document_json: &str,
+    message_cbor_b64: &str,
+) -> Result<String, JsValue> {
+    let encrypted: EncryptedIdentityBundle = serde_json::from_str(encrypted_bundle_json)
+        .map_err(|e| js_err(format!("invalid bundle JSON: {e}")))?;
+    let plain_bytes = decrypt_bundle(passphrase, &encrypted).map_err(js_err)?;
+    let plain: IdentityBundlePlain = serde_json::from_slice(&plain_bytes)
+        .map_err(|e| js_err(format!("bundle corrupted: {e}")))?;
+
+    let message = parse_signed_message_with_sender_document(sender_document_json, message_cbor_b64)?;
+    if message.content_type != CONTENT_TYPE_WHISPER {
+        return Err(js_err(format!("expected application/x-ma-whisper, got {}", message.content_type)));
+    }
+
+    let recipient_encryption_key = restore_encryption_key(&plain.ipns, &plain.encryption_private_key_hex)?;
+    let sender_document = Document::unmarshal(sender_document_json).map_err(js_err)?;
+    let plaintext = decrypt_whisper_payload(&message.content, &recipient_encryption_key, &sender_document)?;
+    String::from_utf8(plaintext).map_err(js_err)
 }
 
 /// Send a room message over iroh using the world protocol.
@@ -698,6 +1212,8 @@ pub async fn send_world_message(
         latest_event_sequence: response.latest_event_sequence,
         broadcasted: response.broadcasted,
         events: response.events,
+        handle: response.handle,
+        pending_whispers: response.pending_whispers,
     })
     .map_err(js_err)
 }
@@ -733,6 +1249,8 @@ pub async fn poll_world_events(
         latest_event_sequence: response.latest_event_sequence,
         broadcasted: response.broadcasted,
         events: response.events,
+        handle: response.handle,
+        pending_whispers: response.pending_whispers,
     })
     .map_err(js_err)
 }

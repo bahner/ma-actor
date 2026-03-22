@@ -10,7 +10,7 @@ PKG_STAMP := www/pkg/.stamp
 build: $(PKG_STAMP)
 
 $(PKG_STAMP): $(BUILD_INPUTS)
-	wasm-pack build --target web --out-dir www/pkg
+	wasm-pack build --dev --target web --out-dir www/pkg
 	touch $(PKG_STAMP)
 
 serve: build

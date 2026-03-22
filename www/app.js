@@ -8,9 +8,27 @@ import init, {
   connect_world_with_relay,
   enter_world,
   poll_world_events,
+  send_world_chat,
+  send_world_whisper,
   send_world_message,
+  decode_chat_event_message,
+  decode_whisper_event_message,
+  start_inbox_listener,
+  poll_inbox_messages,
+  inspect_signed_message,
+  alias_did_root,
+  alias_normalize_endpoint_id,
+  alias_resolve_input,
+  alias_find_alias_for_address,
+  alias_find_did_by_endpoint,
+  alias_humanize_identifier,
+  alias_humanize_text,
   disconnect_world
 } from './pkg/ma_home.js';
+import { createInboundDispatcher } from './inbox-dispatcher.js';
+import { createDialogWriter } from './dialog-writer.js';
+import { createIdentityStore } from './identity-store.js';
+import { createInboxTransport } from './inbox-transport.js';
 
 const STORAGE_PREFIX = 'ma.identity.v3';
 const API_KEY = `${STORAGE_PREFIX}.kuboApi`;
@@ -21,7 +39,6 @@ const DEBUG_KEY = `${STORAGE_PREFIX}.debug`;
 const LEGACY_BUNDLE_KEY = 'ma.identity.v2.bundle';
 const LEGACY_API_KEY = 'ma.identity.v2.kuboApi';
 const LEGACY_ALIAS_KEY = 'ma.identity.v2.alias';
-const LEGACY_PHRASE_KEY = 'ma.identity.v2.recoveryPhrase';
 const DEFAULT_LOCALE = 'en';
 
 const LOCALE_LABELS = {
@@ -29,6 +46,7 @@ const LOCALE_LABELS = {
   'nb-NO': { label: 'Norsk bokmal', here: 'her', me: 'meg', say: 'si', who: 'hvem' }
 };
 const ROOM_POLL_INTERVAL_MS = 1500;
+const DID_DOC_CACHE_TTL_MS = 60_000;
 
 const state = {
   identity: null,
@@ -40,8 +58,13 @@ const state = {
   currentHome: null,
   roomPollTimer: null,
   roomPollInFlight: false,
+  inboxPollInFlight: false,
   pollErrorShown: false,
   passphrase: '',
+  handleDidMap: {},
+  didEndpointMap: {},
+  didDocCache: new Map(),
+  inboxEndpointId: '',
   commandHistory: [],
   historyIndex: -1,
   historyDraft: ''
@@ -76,23 +99,8 @@ function setSetupStatus(message) {
   byId('setup-status').textContent = message;
 }
 
-function appendMessage(role, message) {
-  const transcript = byId('transcript');
-  const row = document.createElement('div');
-  row.className = `msg ${role}`;
-
-  const label = document.createElement('span');
-  label.className = 'msg-role';
-  label.textContent = role;
-
-  const text = document.createElement('p');
-  text.textContent = message;
-
-  row.appendChild(label);
-  row.appendChild(text);
-  transcript.appendChild(row);
-  transcript.scrollTop = transcript.scrollHeight;
-}
+const dialogWriter = createDialogWriter({ byId, displayActor });
+const { appendMessage } = dialogWriter;
 
 // Logging system: logs are shown when debug mode is enabled
 const logger = {
@@ -120,22 +128,34 @@ function stopHomeEventPolling() {
     state.roomPollTimer = null;
   }
   state.roomPollInFlight = false;
+  state.inboxPollInFlight = false;
   state.pollErrorShown = false;
 }
 
-function renderRoomEvent(event) {
-  if (!event || !event.message) {
-    return;
-  }
+const inboundDispatcher = createInboundDispatcher({
+  state,
+  logger,
+  appendMessage,
+  displayActor,
+  humanizeText,
+  fetchDidDocumentJsonByDid,
+  decodeChatEventMessage: decode_chat_event_message,
+  decodeWhisperEventMessage: decode_whisper_event_message,
+  didRoot
+});
 
-  // Avoid showing local chat twice: once as "you" input and once from world fanout.
-  if (event.kind === 'speech' && event.sender && state.aliasName && event.sender === state.aliasName) {
-    return;
-  }
+const { dispatchInboundEvent } = inboundDispatcher;
 
-  const role = event.kind === 'system' ? 'system' : 'world';
-  appendMessage(role, event.message);
-}
+const inboxTransport = createInboxTransport({
+  state,
+  logger,
+  startInboxListener: start_inbox_listener,
+  pollInboxMessages: poll_inbox_messages,
+  inspectSignedMessage: inspect_signed_message,
+  dispatchInboundEvent
+});
+
+const { ensureInboxListener, pollDirectInbox } = inboxTransport;
 
 async function pollCurrentHomeEvents() {
   if (!state.currentHome || state.roomPollInFlight) {
@@ -163,6 +183,10 @@ async function pollCurrentHomeEvents() {
     const elapsed = Date.now() - pollStart;
     logger.log('poll.events', `response ok=${result.ok} events_count=${(result.events || []).length} latest_seq=${result.latest_event_sequence || 0} in ${elapsed}ms`);
 
+    if (!result.ok) {
+      throw new Error(result.message || 'room poll failed');
+    }
+
     if (!state.currentHome || state.currentHome.endpointId !== home.endpointId || state.currentHome.room !== home.room) {
       logger.log('poll.events', `room context changed, discarding response`);
       return;
@@ -175,9 +199,15 @@ async function pollCurrentHomeEvents() {
         logger.log('poll.events', `skipping duplicate event seq=${eventSequence}`);
         continue;
       }
-      logger.log('poll.events', `rendering event seq=${eventSequence} kind=${event.kind} sender=${event.sender || '(system)'}:  ${event.message.slice(0, 40)}`);
-      renderRoomEvent(event);
+      const preview = String(event.message || event.message_cbor_b64 || '').slice(0, 40);
+      logger.log('poll.events', `dispatching event seq=${eventSequence} kind=${event.kind} sender=${event.sender || '(system)'}: ${preview}`);
+      await dispatchInboundEvent(event);
       nextSequence = eventSequence;
+    }
+
+    // Whisper delivery can arrive outside room event stream.
+    for (const whisper of result.pending_whispers || []) {
+      await dispatchInboundEvent(whisper);
     }
 
     state.currentHome.lastEventSequence = Math.max(
@@ -197,7 +227,14 @@ async function pollCurrentHomeEvents() {
 function startHomeEventPolling() {
   stopHomeEventPolling();
   state.roomPollTimer = setInterval(() => {
-    pollCurrentHomeEvents().catch((error) => {
+    Promise.resolve()
+      .then(() =>
+        pollDirectInbox().catch((error) => {
+          logger.log('inbox.poll', `non-fatal inbox poll failure: ${error instanceof Error ? error.message : String(error)}`);
+        })
+      )
+      .then(() => pollCurrentHomeEvents())
+      .catch((error) => {
       if (state.debug) {
         console.error('room event poll failed', error);
       }
@@ -205,7 +242,7 @@ function startHomeEventPolling() {
         appendMessage('system', `Room sync failed: ${error instanceof Error ? error.message : String(error)}`);
         state.pollErrorShown = true;
       }
-    });
+      });
   }, ROOM_POLL_INTERVAL_MS);
 }
 
@@ -214,11 +251,13 @@ function updateIdentityLine() {
     byId('identity-line').textContent = '';
     return;
   }
+  const didLabel = humanizeIdentifier(state.identity.did);
   const locale = state.locale ? ` | locale ${state.locale}` : '';
   const home = state.currentHome
-    ? ` | world ${state.currentHome.alias} (${state.currentHome.room})`
+    ? ` | world ${humanizeIdentifier(state.currentHome.endpointId)} (${state.currentHome.room})`
     : '';
-  byId('identity-line').textContent = `did ${state.identity.did} | ipns ${state.identity.ipns} | alias ${state.aliasName}${locale}${home}`;
+  const inbox = state.inboxEndpointId ? ` | inbox ${humanizeIdentifier(`/iroh/${state.inboxEndpointId}`)}` : '';
+  byId('identity-line').textContent = `did ${didLabel} | ipns ${state.identity.ipns} | alias ${state.aliasName}${locale}${home}${inbox}`;
 }
 
 function showChat() {
@@ -291,23 +330,23 @@ function showSetup() {
 }
 
 function saveAliasBook() {
-  localStorage.setItem(ALIAS_BOOK_KEY, JSON.stringify(state.aliasBook));
+  identityStore.saveAliasBook(ALIAS_BOOK_KEY, state.aliasBook);
 }
 
 function loadAliasBook() {
-  try {
-    const raw = localStorage.getItem(ALIAS_BOOK_KEY);
-    if (!raw) return {};
-    const parsed = JSON.parse(raw);
-    if (!parsed || typeof parsed !== 'object') return {};
-    return parsed;
-  } catch {
-    return {};
-  }
+  return identityStore.loadAliasBook(ALIAS_BOOK_KEY);
 }
 
 function isValidAliasName(aliasName) {
   return /^[a-z0-9_-]{2,32}$/i.test(String(aliasName || '').trim());
+}
+
+function isPrintableAliasLabel(label) {
+  const value = String(label || '').trim();
+  if (!value) return false;
+  // Allow any printable Unicode label, excluding control/format/surrogate chars and spaces.
+  if (/[\p{Cc}\p{Cf}\p{Cs}\s]/u.test(value)) return false;
+  return value.length <= 64;
 }
 
 function normalizeLocale(value) {
@@ -317,6 +356,18 @@ function normalizeLocale(value) {
   }
   return DEFAULT_LOCALE;
 }
+
+const identityStore = createIdentityStore({
+  storagePrefix: STORAGE_PREFIX,
+  legacy: {
+    aliasKey: LEGACY_ALIAS_KEY,
+    bundleKey: LEGACY_BUNDLE_KEY,
+    recoveryPhraseKey: 'ma.identity.v2.recoveryPhrase',
+    defaultLocale: DEFAULT_LOCALE
+  },
+  isValidAliasName,
+  normalizeLocale
+});
 
 function localeLabels() {
   return LOCALE_LABELS[state.locale] || LOCALE_LABELS[DEFAULT_LOCALE];
@@ -346,121 +397,24 @@ function toSequenceBigInt(value) {
   return BigInt(Math.max(0, Math.floor(numeric)));
 }
 
-function identityRecordKey(aliasName) {
-  return `${STORAGE_PREFIX}.identity.${String(aliasName || '').trim().toLowerCase()}`;
-}
-
-function readStoredJson(key) {
-  try {
-    const raw = localStorage.getItem(key);
-    if (!raw) return null;
-    const parsed = JSON.parse(raw);
-    return parsed && typeof parsed === 'object' ? parsed : null;
-  } catch {
-    return null;
-  }
-}
-
-function saveIdentityRecord(aliasName, encryptedBundle, recoveryPhrase) {
-  if (!isValidAliasName(aliasName)) {
-    return;
-  }
-
-  const locale = normalizeLocale(byId('actor-language').value);
-
-  localStorage.setItem(
-    identityRecordKey(aliasName),
-    JSON.stringify({
-      aliasName,
-      encryptedBundle,
-      recoveryPhrase,
-      locale
-    })
-  );
-}
-
-function loadIdentityRecord(aliasName) {
-  if (!isValidAliasName(aliasName)) {
-    return null;
-  }
-
-  const parsed = readStoredJson(identityRecordKey(aliasName));
-  if (!parsed) {
-    return null;
-  }
-
-  return {
-    aliasName: typeof parsed.aliasName === 'string' ? parsed.aliasName : aliasName,
-    encryptedBundle: typeof parsed.encryptedBundle === 'string' ? parsed.encryptedBundle : '',
-    recoveryPhrase: typeof parsed.recoveryPhrase === 'string' ? parsed.recoveryPhrase : '',
-    locale: normalizeLocale(parsed.locale)
-  };
-}
-
-function loadLegacyIdentityRecord(aliasName) {
-  const legacyAlias = localStorage.getItem(LEGACY_ALIAS_KEY);
-  if (!isValidAliasName(aliasName) || legacyAlias !== aliasName) {
-    return null;
-  }
-
-  return {
-    aliasName,
-    encryptedBundle: localStorage.getItem(LEGACY_BUNDLE_KEY) || '',
-    recoveryPhrase: localStorage.getItem(LEGACY_PHRASE_KEY) || '',
-    locale: DEFAULT_LOCALE
-  };
+function saveIdentityRecord(aliasName, encryptedBundle) {
+  identityStore.saveIdentityRecord(aliasName, encryptedBundle, byId('actor-language').value);
 }
 
 function resolveIdentityRecord(aliasName) {
-  return loadIdentityRecord(aliasName) || loadLegacyIdentityRecord(aliasName);
+  return identityStore.resolveIdentityRecord(aliasName);
+}
+
+function scrubStoredRecoveryPhrases() {
+  identityStore.scrubStoredRecoveryPhrases();
 }
 
 function setActiveAlias(aliasName) {
-  const normalized = String(aliasName || '').trim();
-  if (!normalized) {
-    sessionStorage.removeItem(TAB_ALIAS_KEY);
-    return;
-  }
-
-  sessionStorage.setItem(TAB_ALIAS_KEY, normalized);
-  localStorage.setItem(LAST_ALIAS_KEY, normalized);
+  identityStore.setActiveAlias(aliasName, TAB_ALIAS_KEY, LAST_ALIAS_KEY);
 }
 
 function resolveInitialAlias() {
-  const urlAlias = new URLSearchParams(window.location.search).get('alias');
-  if (isValidAliasName(urlAlias)) {
-    return urlAlias.trim();
-  }
-
-  const tabAlias = sessionStorage.getItem(TAB_ALIAS_KEY);
-  if (isValidAliasName(tabAlias)) {
-    return tabAlias.trim();
-  }
-
-  const lastAlias = localStorage.getItem(LAST_ALIAS_KEY);
-  if (isValidAliasName(lastAlias)) {
-    return lastAlias.trim();
-  }
-
-  const legacyAlias = localStorage.getItem(LEGACY_ALIAS_KEY);
-  if (isValidAliasName(legacyAlias)) {
-    return legacyAlias.trim();
-  }
-
-  return '';
-}
-
-function setRecoveryPhraseInput(value) {
-  if (!value) {
-    byId('recovery-phrase').value = '';
-    return;
-  }
-
-  try {
-    byId('recovery-phrase').value = normalizeRecoveryPhrase(value);
-  } catch {
-    byId('recovery-phrase').value = '';
-  }
+  return identityStore.resolveInitialAlias(TAB_ALIAS_KEY, LAST_ALIAS_KEY);
 }
 
 function loadAliasDraft(aliasName) {
@@ -478,9 +432,7 @@ function loadAliasDraft(aliasName) {
   byId('bundle-text').value = record?.encryptedBundle || '';
   setLanguageSelection(record?.locale || DEFAULT_LOCALE);
 
-  if (record?.recoveryPhrase) {
-    setRecoveryPhraseInput(record.recoveryPhrase);
-  } else if (!byId('recovery-phrase').value.trim()) {
+  if (!byId('recovery-phrase').value.trim()) {
     onNewPhrase();
   }
 }
@@ -626,7 +578,7 @@ async function onCreateIdentity() {
 
     const phrase = resolveRecoveryPhraseFromInput();
     byId('recovery-phrase').value = phrase;
-    saveIdentityRecord(aliasName, result.encrypted_bundle, phrase);
+    saveIdentityRecord(aliasName, result.encrypted_bundle);
 
     setSetupStatus('Identity created and unlocked.');
     showChat();
@@ -662,7 +614,7 @@ async function onUnlockIdentity() {
 
     const phrase = resolveRecoveryPhraseFromInput();
     byId('recovery-phrase').value = phrase;
-    saveIdentityRecord(aliasName, updated.encrypted_bundle, phrase);
+    saveIdentityRecord(aliasName, updated.encrypted_bundle);
 
     setSetupStatus('Bundle unlocked.');
     showChat();
@@ -678,7 +630,7 @@ function onNewPhrase() {
   const aliasName = byId('alias-name').value.trim();
   const bundle = byId('bundle-text').value.trim();
   if (isValidAliasName(aliasName)) {
-    saveIdentityRecord(aliasName, bundle, phrase);
+    saveIdentityRecord(aliasName, bundle);
   }
 }
 
@@ -705,7 +657,7 @@ async function applyLocaleChange(localeValue) {
   }
 
   if (isValidAliasName(aliasName)) {
-    saveIdentityRecord(aliasName, byId('bundle-text').value.trim(), phrase);
+    saveIdentityRecord(aliasName, byId('bundle-text').value.trim());
   }
 
   updateIdentityLine();
@@ -719,6 +671,7 @@ function lockSession() {
   state.encryptedBundle = '';
   state.passphrase = '';
   state.currentHome = null;
+  state.didDocCache.clear();
   byId('transcript').innerHTML = '';
   setSetupStatus('Session locked. Bundle remains stored unless removed manually.');
   showSetup();
@@ -754,6 +707,126 @@ function normalizeIrohAddress(address) {
     return value.slice('/iroh/'.length);
   }
   return value;
+}
+
+function normalizeEndpointId(address) {
+  const normalized = alias_normalize_endpoint_id(address);
+  if (!normalized) {
+    return '';
+  }
+  return normalized;
+}
+
+function didRoot(input) {
+  return alias_did_root(String(input || ''));
+}
+
+function findDidByEndpoint(endpointLike) {
+  try {
+    return alias_find_did_by_endpoint(
+      String(endpointLike || ''),
+      JSON.stringify(state.didEndpointMap || {})
+    );
+  } catch {
+    return '';
+  }
+}
+
+function findAliasForAddress(address) {
+  try {
+    return alias_find_alias_for_address(
+      String(address || ''),
+      JSON.stringify(state.aliasBook || {})
+    );
+  } catch {
+    return '';
+  }
+}
+
+function resolveAliasInput(value) {
+  try {
+    return alias_resolve_input(
+      String(value || ''),
+      JSON.stringify(state.aliasBook || {})
+    );
+  } catch {
+    return String(value || '').trim();
+  }
+}
+
+function humanizeIdentifier(value) {
+  try {
+    return alias_humanize_identifier(
+      String(value || ''),
+      JSON.stringify(state.aliasBook || {})
+    );
+  } catch {
+    return String(value || '').trim();
+  }
+}
+
+function humanizeText(text) {
+  try {
+    return alias_humanize_text(
+      String(text || ''),
+      JSON.stringify(state.aliasBook || {})
+    );
+  } catch {
+    return String(text || '');
+  }
+}
+
+function didToIpnsName(did) {
+  const root = didRoot(did);
+  const prefix = 'did:ma:';
+  if (!root.startsWith(prefix)) {
+    throw new Error(`Unsupported DID method for ${did}`);
+  }
+  return root.slice(prefix.length);
+}
+
+async function fetchDidDocumentJsonByDid(did) {
+  const rootDid = didRoot(did);
+  const cached = state.didDocCache.get(rootDid);
+  if (cached && Date.now() - cached.fetchedAt < DID_DOC_CACHE_TTL_MS) {
+    logger.log('did.cache', `hit for ${rootDid}`);
+    return cached.documentJson;
+  }
+
+  logger.log('did.cache', `miss for ${rootDid}`);
+  const ipns = didToIpnsName(rootDid);
+  const resolved = await kuboPost('/api/v0/name/resolve', {
+    arg: `/ipns/${ipns}`,
+    recursive: 'true'
+  });
+  const path = String(resolved?.Path || '').trim();
+  if (!path.startsWith('/ipfs/')) {
+    throw new Error(`name/resolve did not return /ipfs path for ${rootDid}`);
+  }
+
+  const base = getApiBase();
+  const url = `${base}/api/v0/cat?${new URLSearchParams({ arg: path }).toString()}`;
+  const response = await fetch(url, { method: 'POST' });
+  if (!response.ok) {
+    throw new Error(`Kubo cat failed (${response.status}) for ${path}`);
+  }
+  const documentJson = await response.text();
+  state.didDocCache.set(rootDid, {
+    fetchedAt: Date.now(),
+    documentJson
+  });
+  return documentJson;
+}
+
+function displayActor(senderDid, senderHandle) {
+  const fullDid = String(senderDid || '').trim();
+  const root = didRoot(fullDid);
+  const alias = findAliasForAddress(fullDid) || findAliasForAddress(root) || '';
+  if (alias) return alias;
+  if (senderHandle) return senderHandle;
+  if (fullDid) return fullDid;
+  if (root) return root;
+  return 'unknown';
 }
 
 function isLikelyIrohAddress(address) {
@@ -912,9 +985,12 @@ async function enterHome(target) {
     throw new Error('Usage: /enter </iroh/...|alias>');
   }
 
-  const aliasValue = state.aliasBook[alias] || alias;
-  const endpointId = normalizeIrohAddress(aliasValue);
-  logger.log('enter.home', `alias=${alias} resolved=${aliasValue} endpoint=${endpointId.slice(0, 8)}...`);
+  const resolvedInput = resolveAliasInput(alias);
+  let endpointId = normalizeIrohAddress(resolvedInput);
+  if (String(resolvedInput).startsWith('did:ma:')) {
+    endpointId = state.didEndpointMap[didRoot(resolvedInput)] || endpointId;
+  }
+  logger.log('enter.home', `alias=${alias} resolved=${resolvedInput} endpoint=${endpointId.slice(0, 8)}...`);
   
   if (!isLikelyIrohAddress(endpointId)) {
     throw new Error(
@@ -922,26 +998,44 @@ async function enterHome(target) {
     );
   }
 
-  appendMessage('system', `Connecting to ${alias}...`);
+  appendMessage('system', `Connecting to ${humanizeIdentifier(endpointId)}...`);
   const result = JSON.parse(
     await enterWorldWithRetry(endpointId, state.aliasName, 'lobby')
   );
   logger.log('enter.home', `result ok=${result.ok} room=${result.room} endpoint=${result.endpoint_id?.slice(0, 8)}... latest_seq=${result.latest_event_sequence || 0}`);
 
+  if (!result.ok) {
+    throw new Error(result.message || 'enter failed');
+  }
+
+  const activeRoom = result.room || 'lobby';
+
   state.currentHome = {
-    alias,
+    alias: findAliasForAddress(endpointId) || alias,
     endpointId,
-    room: result.room || 'lobby',
-    lastEventSequence: toSequenceNumber(result.latest_event_sequence || 0)
+    room: activeRoom,
+    lastEventSequence: toSequenceNumber(result.latest_event_sequence || 0),
+    handle: result.handle || state.aliasName
   };
   updateIdentityLine();
+
+  await ensureInboxListener();
+  updateIdentityLine();
+
+  for (const whisper of result.pending_whispers || []) {
+    await dispatchInboundEvent(whisper);
+  }
+
   startHomeEventPolling();
   await pollCurrentHomeEvents();
 
-  appendMessage('system', `Entered ${alias}.`);
-  appendMessage('system', `Home endpoint: ${result.endpoint_id}`);
-  appendMessage('system', `Current room: ${result.room}`);
-  appendMessage('system', result.message || 'Connected to home.');
+  appendMessage('system', `Entered ${humanizeIdentifier(endpointId)}.`);
+  appendMessage('system', `Home endpoint: ${humanizeIdentifier(result.endpoint_id)}`);
+  appendMessage('system', `Current room: ${activeRoom}`);
+  if (result.handle) {
+    appendMessage('system', `Assigned handle: ${result.handle}`);
+  }
+  appendMessage('system', humanizeText(result.message || 'Connected to home.'));
 }
 
 async function sendCurrentWorldMessage(text) {
@@ -950,22 +1044,77 @@ async function sendCurrentWorldMessage(text) {
     return;
   }
 
+  // Standard chat UX: @target message defaults to whisper.
+  // Legacy actor grammar still works for @here/@me/@radio commands.
+  if (text.trim().startsWith('@')) {
+    const mention = text.trim().match(/^@(\S+)\s+(.+)$/);
+    if (mention) {
+      const target = mention[1];
+      let payload = mention[2].trim();
+      if (/^say\s+/i.test(payload)) {
+        payload = payload.replace(/^say\s+/i, '').trim();
+      }
+
+      const normalized = target.toLowerCase();
+      const isLegacyTarget = ['here', 'her', 'room', 'world', 'me', 'meg', 'radio'].includes(normalized);
+      if (!isLegacyTarget && payload) {
+        await sendWhisperToDid(target, payload);
+        appendMessage('system', `Whisper sent to ${target}.`);
+        return;
+      }
+    }
+
+    const sendStart = Date.now();
+    logger.log('send.message', `legacy envelope room=${state.currentHome.room} to=${state.currentHome.alias} actor=${state.aliasName} msg_len=${text.length}`);
+    const result = JSON.parse(
+      await send_world_message(
+        state.currentHome.endpointId,
+        state.passphrase,
+        state.encryptedBundle,
+        state.aliasName,
+        state.currentHome.room,
+        state.locale,
+        text
+      )
+    );
+    const elapsed = Date.now() - sendStart;
+    logger.log('send.message', `legacy response ok=${result.ok} broadcasted=${result.broadcasted} latest_seq=${result.latest_event_sequence || 0} in ${elapsed}ms`);
+
+    if (!result.ok) {
+      throw new Error(result.message || 'send failed');
+    }
+
+    if (!result.broadcasted) {
+      state.currentHome.lastEventSequence = toSequenceNumber(
+        result.latest_event_sequence || state.currentHome.lastEventSequence || 0
+      );
+      appendMessage('world', result.message || '(no response)');
+      return;
+    }
+
+    await pollCurrentHomeEvents();
+    return;
+  }
+
   const sendStart = Date.now();
-  logger.log('send.message', `room=${state.currentHome.room} to=${state.currentHome.alias} actor=${state.aliasName} msg_len=${text.length}`);
+  logger.log('send.chat', `room=${state.currentHome.room} to=${state.currentHome.alias} actor=${state.aliasName} msg_len=${text.length}`);
   
   const result = JSON.parse(
-    await send_world_message(
+    await send_world_chat(
       state.currentHome.endpointId,
       state.passphrase,
       state.encryptedBundle,
       state.aliasName,
       state.currentHome.room,
-      state.locale,
       text
     )
   );
   const elapsed = Date.now() - sendStart;
-  logger.log('send.message', `response ok=${result.ok} broadcasted=${result.broadcasted} latest_seq=${result.latest_event_sequence || 0} in ${elapsed}ms`);
+  logger.log('send.chat', `response ok=${result.ok} broadcasted=${result.broadcasted} latest_seq=${result.latest_event_sequence || 0} in ${elapsed}ms`);
+
+  if (!result.ok) {
+    throw new Error(result.message || 'chat send failed');
+  }
   
   if (!result.broadcasted) {
     state.currentHome.lastEventSequence = toSequenceNumber(
@@ -976,6 +1125,40 @@ async function sendCurrentWorldMessage(text) {
   }
 
   await pollCurrentHomeEvents();
+}
+
+async function sendWhisperToDid(targetDidOrAlias, text) {
+  if (!state.identity || !state.currentHome) {
+    throw new Error('Join a home before sending whispers.');
+  }
+
+  const key = String(targetDidOrAlias || '').trim();
+  if (!key) {
+    throw new Error('Usage: /whisper <did-or-alias> <message>');
+  }
+
+  const resolved = resolveAliasInput(key);
+  const mappedDid = state.handleDidMap[key] || state.handleDidMap[resolved] || '';
+  const targetDid = mappedDid || findDidByEndpoint(resolved) || resolved;
+  if (!String(targetDid).startsWith('did:ma:')) {
+    throw new Error(`Whisper target must be a did:ma: DID, alias, or known handle mapped to a DID. Got: ${targetDid}`);
+  }
+
+  const recipientDocumentJson = await fetchDidDocumentJsonByDid(targetDid);
+  const result = JSON.parse(
+    await send_world_whisper(
+      state.currentHome.endpointId,
+      state.passphrase,
+      state.encryptedBundle,
+      state.aliasName,
+      recipientDocumentJson,
+      text
+    )
+  );
+
+  if (!result.ok) {
+    throw new Error(result.message || 'whisper failed');
+  }
 }
 
 function parseSlash(input) {
@@ -997,15 +1180,17 @@ function parseSlash(input) {
     appendMessage('system', '  /aliases                   - list saved aliases');
     appendMessage('system', '  /enter </iroh/...|alias>   - enter a home by endpoint id or alias');
     appendMessage('system', '  /smoke [alias]             - run enter + send + poll smoke test');
+    appendMessage('system', '  /whisper <did|alias> <msg> - send E2E whisper (application/x-ma-whisper)');
     appendMessage('system', '  /locale <en|nb-NO>         - change actor language for this alias');
     appendMessage('system', '  /publish                   - publish DID document to IPNS');
     appendMessage('system', '  /debug [on|off]            - toggle debug logs in transcript');
     appendMessage('system', 'Messaging:');
-    appendMessage('system', '  Hello world                - room chatter');
+    appendMessage('system', '  Hello world                - room chatter (renders as did-or-alias: text)');
+    appendMessage('system', '  @name hello                - whisper shortcut (E2E)');
+    appendMessage('system', `  @name ${labels.say} hello            - whisper shortcut (E2E)`);
     appendMessage('system', `  @${labels.here} ${labels.who}                  - room command: list actors in room`);
-    appendMessage('system', `  @${labels.me} ${labels.say} "hello"            - self command: talk to yourself / test locale aliases`);
-    appendMessage('system', `  @name ${labels.say} "hello"          - direct-style speech`);
-    appendMessage('system', '  @radio turn on             - talk to radio actor');
+    appendMessage('system', `  @${labels.me} ${labels.say} "hello"            - legacy self actor command`);
+    appendMessage('system', '  @radio turn on             - legacy radio actor command');
     return true;
   }
 
@@ -1015,13 +1200,13 @@ function parseSlash(input) {
       return true;
     }
     const { did, ipns } = state.identity;
-    appendMessage('system', `DID:             ${did}`);
+    appendMessage('system', `DID:             ${humanizeIdentifier(did)}`);
     appendMessage('system', `IPNS key:        ${ipns}`);
     appendMessage('system', `Alias:           ${state.aliasName || '(none)'}`);
     appendMessage('system', `Locale:          ${state.locale}`);
     appendMessage('system', `Published field: ma:locale = ${state.locale}`);
     appendMessage('system', `DID document at: https://ipfs.io/ipns/${ipns}`);
-    appendMessage('system', `Current world:   ${state.currentHome ? `${state.currentHome.alias} (${state.currentHome.room})` : '(none)'}`);
+    appendMessage('system', `Current world:   ${state.currentHome ? `${humanizeIdentifier(state.currentHome.endpointId)} (${state.currentHome.room})` : '(none)'}`);
     appendMessage('system', '(run /publish to update the IPNS record)');
     return true;
   }
@@ -1062,8 +1247,8 @@ function parseSlash(input) {
     const [name, ...addressParts] = rest;
     const address = addressParts.join(' ');
 
-    if (!/^[a-z0-9_-]{1,24}$/i.test(name)) {
-      appendMessage('system', 'Alias name must be 1-24 chars using letters, numbers, underscore, or dash.');
+    if (!isPrintableAliasLabel(name)) {
+      appendMessage('system', 'Alias name must be printable UTF-8 (no spaces/control chars), up to 64 chars.');
       return true;
     }
 
@@ -1146,6 +1331,25 @@ function parseSlash(input) {
     return true;
   }
 
+  if (cmd === '/whisper' || cmd === '/w') {
+    if (rest.length < 2) {
+      appendMessage('system', 'Usage: /whisper <did|alias> <message>');
+      return true;
+    }
+    const target = rest[0];
+    const payload = rest.slice(1).join(' ').trim();
+    if (!payload) {
+      appendMessage('system', 'Usage: /whisper <did|alias> <message>');
+      return true;
+    }
+    sendWhisperToDid(target, payload)
+      .then(() => appendMessage('system', `Whisper sent to ${humanizeIdentifier(target)}.`))
+      .catch((err) => {
+        appendMessage('system', humanizeText(`Whisper failed: ${err instanceof Error ? err.message : String(err)}`));
+      });
+    return true;
+  }
+
   return false;
 }
 
@@ -1212,6 +1416,8 @@ function onCommandKeyDown(event) {
 }
 
 function restoreSavedValues() {
+  scrubStoredRecoveryPhrases();
+
   const savedApi = localStorage.getItem(API_KEY) || localStorage.getItem(LEGACY_API_KEY);
   const savedAlias = resolveInitialAlias();
 

@@ -6,11 +6,149 @@ use chacha20poly1305::{
     aead::{Aead, KeyInit},
     Key, XChaCha20Poly1305, XNonce,
 };
-use did_ma::{Did, Document, EncryptionKey, SigningKey, VerificationMethod};
-use iroh::{Endpoint, EndpointId, endpoint::presets};
+use did_ma::{CONTENT_TYPE_COMMAND, Did, Document, EncryptionKey, Message, SigningKey, VerificationMethod};
+use iroh::{
+    Endpoint, EndpointAddr, EndpointId, RelayUrl,
+    endpoint::{Connection, RecvStream, SendStream, presets},
+};
+use js_sys;
+use std::cell::RefCell;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+const DEFAULT_WORLD_RELAY_URL: &str = "https://euc1-1.relay.n0.iroh-canary.iroh.link";
+
+fn normalize_relay_url(input: &str) -> String {
+    let mut value = input.trim().to_string();
+    // Remove all trailing dots and slashes
+    while value.ends_with('.') || value.ends_with('/') {
+        value.pop();
+    }
+    // Ensure it ends with a single /
+    value.push('/');
+    value
+}
+
+struct WorldConnCache {
+    endpoint: Endpoint,
+    connection: Connection,
+    send_stream: SendStream,
+    recv_stream: RecvStream,
+    target_id: String,
+}
+
+thread_local! {
+    static CONN_CACHE: RefCell<Option<WorldConnCache>> = RefCell::new(None);
+}
+
+fn take_conn_cache() -> Option<WorldConnCache> {
+    CONN_CACHE.with(|c| c.borrow_mut().take())
+}
+
+fn store_conn_cache(cache: WorldConnCache) {
+    CONN_CACHE.with(|c| *c.borrow_mut() = Some(cache));
+}
+
+fn clear_conn_cache() {
+    CONN_CACHE.with(|c| *c.borrow_mut() = None);
+}
+
+async fn create_stream_cache(target_id_str: &str, relay_hint: Option<&str>) -> Result<WorldConnCache, JsValue> {
+    let target: EndpointId = target_id_str
+        .trim()
+        .parse()
+        .map_err(|e| js_err(format!("invalid endpoint id: {e}")))?;
+
+    let endpoint = Endpoint::builder(presets::N0).bind()
+        .await
+        .map_err(js_err)?;
+
+    // Give the endpoint a brief chance to establish its relay/discovery presence
+    // before attempting peer connect by endpoint id.
+    let _ = endpoint.online().await;
+
+    let mut endpoint_addr = EndpointAddr::new(target);
+    let relay_source = normalize_relay_url(relay_hint.unwrap_or(DEFAULT_WORLD_RELAY_URL));
+    
+    match relay_source.parse::<RelayUrl>() {
+        Ok(relay_url) => {
+            endpoint_addr = endpoint_addr.with_relay_url(relay_url);
+        }
+        Err(e) => {
+            return Err(js_err(format!("relay URL parse failed for '{}': {}", relay_source, e)));
+        }
+    }
+
+    let connection = endpoint.connect(endpoint_addr, WORLD_ALPN)
+        .await
+        .map_err(|e| js_err(format!("endpoint.connect() failed: {}", e)))?;
+    
+    let (send_stream, recv_stream) = connection.open_bi()
+        .await
+        .map_err(|e| js_err(format!("connection.open_bi() failed: {}", e)))?;
+
+    Ok(WorldConnCache {
+        endpoint,
+        connection,
+        send_stream,
+        recv_stream,
+        target_id: target_id_str.to_string(),
+    })
+}
+
+async fn get_or_create_stream_cache(target_id_str: &str) -> Result<WorldConnCache, JsValue> {
+    if let Some(cached) = take_conn_cache() {
+        if cached.target_id == target_id_str {
+            return Ok(cached);
+        }
+        cached.connection.close(0u32.into(), b"switch target");
+        cached.endpoint.close().await;
+    }
+
+    create_stream_cache(target_id_str, None).await
+}
+
+async fn exchange_on_stream(cache: &mut WorldConnCache, request: &WorldRequest) -> Result<WorldResponse, JsValue> {
+    let payload = serde_json::to_vec(request).map_err(js_err)?;
+    if payload.len() > 256 * 1024 {
+        return Err(js_err("request frame too large"));
+    }
+
+    cache
+        .send_stream
+        .write_u32(payload.len() as u32)
+        .await
+        .map_err(|e| js_err(format!("write frame length failed: {e}")))?;
+    cache
+        .send_stream
+        .write_all(&payload)
+        .await
+        .map_err(|e| js_err(format!("iroh send failed: {e}")))?;
+    cache
+        .send_stream
+        .flush()
+        .await
+        .map_err(|e| js_err(format!("iroh flush failed: {e}")))?;
+
+    let response_len = cache
+        .recv_stream
+        .read_u32()
+        .await
+        .map_err(|e| js_err(format!("read frame length failed: {e}")))? as usize;
+    if response_len > 512 * 1024 {
+        return Err(js_err("response frame too large"));
+    }
+
+    let mut response_bytes = vec![0u8; response_len];
+    cache
+        .recv_stream
+        .read_exact(&mut response_bytes)
+        .await
+        .map_err(|e| js_err(format!("iroh read failed: {e}")))?;
+
+    serde_json::from_slice(&response_bytes).map_err(js_err)
+}
 use ma_actor_core::{canonical_locale, parse_message_with_locale};
 use serde::{Deserialize, Serialize};
-use tokio::io::AsyncWriteExt;
 use wasm_bindgen::prelude::*;
 
 // ── Data structures ────────────────────────────────────────────────────────────
@@ -60,14 +198,14 @@ struct UpdateResult {
 #[derive(Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 enum WorldRequest {
-    Enter {
-        actor_name: String,
-        did: String,
-        room: Option<String>,
-    },
+    Signed { message_cbor: Vec<u8> },
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum WorldCommand {
+    Enter { room: Option<String> },
     Message {
-        actor_name: String,
-        did: String,
         room: String,
         envelope: ma_actor_core::MessageEnvelope,
     },
@@ -110,6 +248,7 @@ struct WorldActionResult {
 }
 
 const WORLD_ALPN: &[u8] = b"ma/world/1";
+const WORLD_TARGET_DID: &str = "did:ma:world";
 
 #[derive(Serialize)]
 struct IpnsPointer {
@@ -194,44 +333,83 @@ fn decrypt_bundle(passphrase: &str, bundle: &EncryptedIdentityBundle) -> Result<
 }
 
 async fn send_world_request(endpoint_id: &str, request: WorldRequest) -> Result<WorldResponse, JsValue> {
-    let endpoint_id: EndpointId = endpoint_id
-        .trim()
-        .parse()
-        .map_err(|e| js_err(format!("invalid iroh endpoint id: {e}")))?;
+    let mut last_error: Option<JsValue> = None;
+    for _ in 0..2 {
+        let mut cache = get_or_create_stream_cache(endpoint_id).await?;
+        match exchange_on_stream(&mut cache, &request).await {
+            Ok(response) => {
+                store_conn_cache(cache);
+                return Ok(response);
+            }
+            Err(err) => {
+                last_error = Some(err);
+                cache.connection.close(0u32.into(), b"stream error");
+                cache.endpoint.close().await;
+                clear_conn_cache();
+            }
+        }
+    }
 
-    let endpoint = Endpoint::builder(presets::N0)
-        .bind()
-        .await
+    Err(last_error.unwrap_or_else(|| js_err("world request failed")))
+}
+
+/// Close and drop the cached world connection (call on lock/logout).
+#[wasm_bindgen]
+pub async fn disconnect_world() {
+    if let Some(cached) = take_conn_cache() {
+        cached.connection.close(0u32.into(), b"bye");
+        cached.endpoint.close().await;
+    }
+}
+
+fn build_signed_world_request(
+    passphrase: &str,
+    encrypted_bundle_json: &str,
+    actor_name: &str,
+    command: WorldCommand,
+    timestamp_ms: u64,
+) -> Result<WorldRequest, JsValue> {
+    let encrypted: EncryptedIdentityBundle = serde_json::from_str(encrypted_bundle_json)
+        .map_err(|e| js_err(format!("invalid bundle JSON: {e}")))?;
+    let plain_bytes = decrypt_bundle(passphrase, &encrypted).map_err(js_err)?;
+    let plain: IdentityBundlePlain = serde_json::from_slice(&plain_bytes)
+        .map_err(|e| js_err(format!("bundle corrupted: {e}")))?;
+
+    let actor_name = actor_name.trim();
+    if actor_name.is_empty() {
+        return Err(js_err("actor_name is required for DID fragment"));
+    }
+
+    let from_did = Did::try_from(plain.document.id.as_str())
+        .and_then(|did| did.with_fragment(actor_name))
         .map_err(js_err)?;
+use did_ma::msg::message_type;
 
-    let connection = endpoint
-        .connect(endpoint_id, WORLD_ALPN)
-        .await
-        .map_err(|e| js_err(format!("iroh connect failed: {e}")))?;
-    let (mut send, mut recv) = connection
-        .open_bi()
-        .await
-        .map_err(|e| js_err(format!("iroh stream open failed: {e}")))?;
+    let signing_key = restore_signing_key(&plain.ipns, &plain.signing_private_key_hex)?;
+    let content = serde_json::to_vec(&command).map_err(js_err)?;
+    
+    // Create message with custom timestamp from JavaScript (in milliseconds, convert to seconds)
+    let timestamp_secs = timestamp_ms / 1000;
+    let mut message = Message {
+        id: format!("{}", timestamp_ms), // Simple deterministic ID based on timestamp
+        message_type: message_type(),
+        from: from_did.id().to_string(),
+        to: WORLD_TARGET_DID.to_string(),
+        created_at: timestamp_secs,
+        content_type: CONTENT_TYPE_COMMAND.to_string(),
+        content,
+        signature: Vec::new(),
+    };
 
-    let payload = serde_json::to_vec(&request).map_err(js_err)?;
-    send.write_all(&payload)
-        .await
-        .map_err(|e| js_err(format!("iroh send failed: {e}")))?;
-    send.flush()
-        .await
-        .map_err(|e| js_err(format!("iroh flush failed: {e}")))?;
-    send.finish().map_err(js_err)?;
+    // Sign the message
+    message.sign(&signing_key)
+        .map_err(|e| js_err(format!("message signing failed: {}", e)))?;
+    message.sign(&signing_key)
+        .map_err(|e| js_err(format!("message signing failed: {}", e)))?;
 
-    let response_bytes = recv
-        .read_to_end(64 * 1024)
-        .await
-        .map_err(|e| js_err(format!("iroh read failed: {e}")))?;
-    let response: WorldResponse = serde_json::from_slice(&response_bytes).map_err(js_err)?;
-
-    connection.close(0u32.into(), b"ok");
-    endpoint.close().await;
-
-    Ok(response)
+    Ok(WorldRequest::Signed {
+        message_cbor: message.to_cbor().map_err(js_err)?,
+    })
 }
 
 fn restore_signing_key(ipns: &str, private_key_hex: &str) -> Result<SigningKey, JsValue> {
@@ -437,26 +615,44 @@ pub fn clear_bundle_presence_hint(
 
 /// Enter a world over iroh using the world protocol.
 #[wasm_bindgen]
+pub async fn connect_world(endpoint_id: &str) -> Result<(), JsValue> {
+    let cache = get_or_create_stream_cache(endpoint_id).await?;
+    store_conn_cache(cache);
+    Ok(())
+}
+
+#[wasm_bindgen]
+pub async fn connect_world_with_relay(endpoint_id: &str, relay_url: &str) -> Result<(), JsValue> {
+    let cache = create_stream_cache(endpoint_id, Some(relay_url)).await?;
+    store_conn_cache(cache);
+    Ok(())
+}
+
+/// Enter a world over iroh using the world protocol.
+#[wasm_bindgen]
 pub async fn enter_world(
     endpoint_id: &str,
+    passphrase: &str,
+    encrypted_bundle_json: &str,
     actor_name: &str,
-    did: &str,
     room: &str,
 ) -> Result<String, JsValue> {
     let room = room.trim();
-    let response = send_world_request(
-        endpoint_id,
-        WorldRequest::Enter {
-            actor_name: actor_name.trim().to_string(),
-            did: did.trim().to_string(),
+    let timestamp_ms = js_sys::Date::now() as u64;
+    let request = build_signed_world_request(
+        passphrase,
+        encrypted_bundle_json,
+        actor_name,
+        WorldCommand::Enter {
             room: if room.is_empty() {
                 None
             } else {
                 Some(room.to_string())
             },
         },
-    )
-    .await?;
+        timestamp_ms,
+    )?;
+    let response = send_world_request(endpoint_id, request).await?;
 
     serde_json::to_string(&WorldActionResult {
         ok: response.ok,
@@ -474,22 +670,25 @@ pub async fn enter_world(
 #[wasm_bindgen]
 pub async fn send_world_message(
     endpoint_id: &str,
+    passphrase: &str,
+    encrypted_bundle_json: &str,
     actor_name: &str,
-    did: &str,
     room: &str,
     locale: &str,
     text: &str,
 ) -> Result<String, JsValue> {
-    let response = send_world_request(
-        endpoint_id,
-        WorldRequest::Message {
-            actor_name: actor_name.trim().to_string(),
-            did: did.trim().to_string(),
+    let timestamp_ms = js_sys::Date::now() as u64;
+    let request = build_signed_world_request(
+        passphrase,
+        encrypted_bundle_json,
+        actor_name,
+        WorldCommand::Message {
             room: room.trim().to_string(),
             envelope: parse_message_with_locale(text, canonical_locale(locale)),
         },
-    )
-    .await?;
+        timestamp_ms,
+    )?;
+    let response = send_world_request(endpoint_id, request).await?;
 
     serde_json::to_string(&WorldActionResult {
         ok: response.ok,
@@ -507,17 +706,24 @@ pub async fn send_world_message(
 #[wasm_bindgen]
 pub async fn poll_world_events(
     endpoint_id: &str,
+    passphrase: &str,
+    encrypted_bundle_json: &str,
+    actor_name: &str,
     room: &str,
     since_sequence: u64,
 ) -> Result<String, JsValue> {
-    let response = send_world_request(
-        endpoint_id,
-        WorldRequest::RoomEvents {
+    let timestamp_ms = js_sys::Date::now() as u64;
+    let request = build_signed_world_request(
+        passphrase,
+        encrypted_bundle_json,
+        actor_name,
+        WorldCommand::RoomEvents {
             room: room.trim().to_string(),
             since_sequence,
         },
-    )
-    .await?;
+        timestamp_ms,
+    )?;
+    let response = send_world_request(endpoint_id, request).await?;
 
     serde_json::to_string(&WorldActionResult {
         ok: response.ok,

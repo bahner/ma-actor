@@ -1,6 +1,6 @@
-# ma-actor
+# ma-home
 
-A WebAssembly actor client built on top of `did-ma`.
+A WebAssembly home client built on top of `did-ma`.
 
 It creates/unlocks local encrypted identity bundles, publishes DID documents to IPNS via Kubo, and provides a command-driven browser UI.
 
@@ -63,7 +63,7 @@ make distclean
 - `alias <name> <address>`
 - `/unalias <name>`
 - `/aliases`
-- `/enter <iroh:...|alias>`
+- `/enter </iroh/...|alias>`
 - `/publish` (publishes DID document to IPNS)
 
 ## Home Entry Over Iroh
@@ -71,27 +71,27 @@ make distclean
 You can save a world alias using an advertised Iroh endpoint id and then enter it:
 
 ```text
-alias home iroh:bf19268b811bbee577021f97f90d08bd752921c1f7d98a3b00a9900a261790bc
+alias home /iroh/bf19268b811bbee577021f97f90d08bd752921c1f7d98a3b00a9900a261790bc
 /enter home
 ```
 
 Current behavior:
 
 - The browser WASM client uses `iroh` directly
-- `/enter` accepts either a literal `iroh:` endpoint id or an alias to one
-- The client opens an Iroh connection to `ma-home` over the home protocol ALPN
-- Plain chat text after `/enter` is sent to the current home and room
-- Room chatter is fanned out by `ma-home` and polled by each actor, so all connected actors in the room receive the same speech events
+- `/enter` accepts either a literal `/iroh/<endpoint-id>` value or an alias to one
+- The client opens an Iroh connection to `ma-world` over the world protocol ALPN
+- Plain chat text after `/enter` is sent to the current world and room
+- Room chatter is fanned out by `ma-world` and polled by each avatar, so all connected avatars in the room receive the same speech events
 
-The localhost status page in `ma-home` is still useful for inspection, but it is no longer the transport path for `/enter`.
+The localhost status page in `ma-world` is still useful for inspection, but it is no longer the transport path for `/enter`.
 
 ## Identity and Publish Model
 
 - Encrypted bundle is local/private (browser storage + export file)
 - DID document is public and publishable
 - `/publish` uploads DID document JSON to IPFS and updates IPNS record
-- Browser storage is namespaced per alias, so one browser profile can keep multiple local actors
-- The currently active alias is remembered per browser tab, which allows concurrent actors in separate tabs/windows on the same origin
+- Browser storage is namespaced per alias, so one browser profile can keep multiple local homes
+- The currently active alias is remembered per browser tab, which allows concurrent homes in separate tabs/windows on the same origin
 - The actor locale is configurable per alias; localized `@` aliases are mapped to canonical protocol targets before sending
 - The published DID document carries the preferred locale in `ma:locale` using canonical locale tags such as `en` and `nb-NO`
 

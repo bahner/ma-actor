@@ -4,16 +4,20 @@ import init, {
   set_bundle_locale,
   generate_bip39_phrase,
   normalize_bip39_phrase,
+  connect_world,
+  connect_world_with_relay,
   enter_world,
   poll_world_events,
-  send_world_message
-} from './pkg/ma_actor.js';
+  send_world_message,
+  disconnect_world
+} from './pkg/ma_home.js';
 
 const STORAGE_PREFIX = 'ma.identity.v3';
 const API_KEY = `${STORAGE_PREFIX}.kuboApi`;
 const ALIAS_BOOK_KEY = `${STORAGE_PREFIX}.aliasBook`;
 const LAST_ALIAS_KEY = `${STORAGE_PREFIX}.lastAlias`;
 const TAB_ALIAS_KEY = `${STORAGE_PREFIX}.tabAlias`;
+const DEBUG_KEY = `${STORAGE_PREFIX}.debug`;
 const LEGACY_BUNDLE_KEY = 'ma.identity.v2.bundle';
 const LEGACY_API_KEY = 'ma.identity.v2.kuboApi';
 const LEGACY_ALIAS_KEY = 'ma.identity.v2.alias';
@@ -31,15 +35,32 @@ const state = {
   encryptedBundle: '',
   aliasName: '',
   locale: DEFAULT_LOCALE,
+  debug: false,
   aliasBook: {},
   currentHome: null,
   roomPollTimer: null,
   roomPollInFlight: false,
   pollErrorShown: false,
+  passphrase: '',
   commandHistory: [],
   historyIndex: -1,
   historyDraft: ''
 };
+
+function readStoredDebugFlag() {
+  const raw = localStorage.getItem(DEBUG_KEY);
+  if (!raw) return false;
+  const value = raw.trim().toLowerCase();
+  return value === '1' || value === 'true' || value === 'on';
+}
+
+function setDebugMode(enabled, announce = true) {
+  state.debug = Boolean(enabled);
+  localStorage.setItem(DEBUG_KEY, state.debug ? '1' : '0');
+  if (announce) {
+    appendMessage('system', `Debug mode: ${state.debug ? 'on' : 'off'}`);
+  }
+}
 
 function byId(id) {
   return document.getElementById(id);
@@ -73,6 +94,26 @@ function appendMessage(role, message) {
   transcript.scrollTop = transcript.scrollHeight;
 }
 
+// Logging system: logs are shown when debug mode is enabled
+const logger = {
+  log(scope, ...args) {
+    if (!state.debug) return;
+    const message = args
+      .map(arg => {
+        if (typeof arg === 'object') {
+          try {
+            return JSON.stringify(arg);
+          } catch {
+            return String(arg);
+          }
+        }
+        return String(arg);
+      })
+      .join(' ');
+    appendMessage('system', `[${scope}] ${message}`);
+  }
+};
+
 function stopHomeEventPolling() {
   if (state.roomPollTimer) {
     clearInterval(state.roomPollTimer);
@@ -84,6 +125,11 @@ function stopHomeEventPolling() {
 
 function renderRoomEvent(event) {
   if (!event || !event.message) {
+    return;
+  }
+
+  // Avoid showing local chat twice: once as "you" input and once from world fanout.
+  if (event.kind === 'speech' && event.sender && state.aliasName && event.sender === state.aliasName) {
     return;
   }
 
@@ -99,12 +145,26 @@ async function pollCurrentHomeEvents() {
   state.roomPollInFlight = true;
 
   const home = state.currentHome;
+  const pollStart = Date.now();
+  
   try {
+    logger.log('poll.events', `room=${home.room} since_seq=${home.lastEventSequence || 0} endpoint=${home.endpointId.slice(0, 8)}...`);
+    
     const result = JSON.parse(
-      await poll_world_events(home.endpointId, home.room, toSequenceBigInt(home.lastEventSequence || 0))
+      await poll_world_events(
+        home.endpointId,
+        state.passphrase,
+        state.encryptedBundle,
+        state.aliasName,
+        home.room,
+        toSequenceBigInt(home.lastEventSequence || 0)
+      )
     );
+    const elapsed = Date.now() - pollStart;
+    logger.log('poll.events', `response ok=${result.ok} events_count=${(result.events || []).length} latest_seq=${result.latest_event_sequence || 0} in ${elapsed}ms`);
 
     if (!state.currentHome || state.currentHome.endpointId !== home.endpointId || state.currentHome.room !== home.room) {
+      logger.log('poll.events', `room context changed, discarding response`);
       return;
     }
 
@@ -112,8 +172,10 @@ async function pollCurrentHomeEvents() {
     for (const event of result.events || []) {
       const eventSequence = toSequenceNumber(event.sequence);
       if (eventSequence <= nextSequence) {
+        logger.log('poll.events', `skipping duplicate event seq=${eventSequence}`);
         continue;
       }
+      logger.log('poll.events', `rendering event seq=${eventSequence} kind=${event.kind} sender=${event.sender || '(system)'}:  ${event.message.slice(0, 40)}`);
       renderRoomEvent(event);
       nextSequence = eventSequence;
     }
@@ -123,6 +185,10 @@ async function pollCurrentHomeEvents() {
       toSequenceNumber(result.latest_event_sequence || home.lastEventSequence || 0)
     );
     state.pollErrorShown = false;
+  } catch (error) {
+    const elapsed = Date.now() - pollStart;
+    logger.log('poll.events', `failed after ${elapsed}ms: ${error instanceof Error ? error.message : String(error)}`);
+    throw error;
   } finally {
     state.roomPollInFlight = false;
   }
@@ -132,7 +198,9 @@ function startHomeEventPolling() {
   stopHomeEventPolling();
   state.roomPollTimer = setInterval(() => {
     pollCurrentHomeEvents().catch((error) => {
-      console.error('room event poll failed', error);
+      if (state.debug) {
+        console.error('room event poll failed', error);
+      }
       if (!state.pollErrorShown) {
         appendMessage('system', `Room sync failed: ${error instanceof Error ? error.message : String(error)}`);
         state.pollErrorShown = true;
@@ -161,7 +229,59 @@ function showChat() {
   const aliases = Object.keys(state.aliasBook).length;
   appendMessage('system', 'Ready to explore.');
   appendMessage('system', `Saved aliases: ${aliases}. Use /help for commands.`);
+  if (state.debug) {
+    logger.log('app', 'debug mode is on');
+  }
   byId('command-input').focus();
+}
+
+async function runSmokeTest(targetAlias) {
+  if (!state.identity) {
+    throw new Error('Load or create an identity before running smoke test.');
+  }
+
+  const alias = String(targetAlias || state.currentHome?.alias || 'home').trim();
+  if (!alias) {
+    throw new Error('Usage: /smoke [alias]');
+  }
+
+  const marker = `smoke-${Date.now().toString(36)}`;
+  appendMessage('system', `Smoke: enter ${alias} -> send marker -> poll`);
+
+  await enterHome(alias);
+
+  if (!state.currentHome) {
+    throw new Error('Smoke failed: no active home after enter.');
+  }
+
+  const sendResult = JSON.parse(
+    await withTimeout(
+      send_world_message(
+        state.currentHome.endpointId,
+        state.passphrase,
+        state.encryptedBundle,
+        state.aliasName,
+        state.currentHome.room,
+        state.locale,
+        marker
+      ),
+      12000,
+      'smoke send timed out'
+    )
+  );
+
+  if (!sendResult.ok) {
+    throw new Error(`Smoke failed: send returned ok=false (${sendResult.message || 'no message'})`);
+  }
+
+  const beforeSeq = toSequenceNumber(state.currentHome.lastEventSequence || 0);
+  await withTimeout(pollCurrentHomeEvents(), 12000, 'smoke poll timed out');
+  const afterSeq = toSequenceNumber(state.currentHome.lastEventSequence || 0);
+
+  appendMessage(
+    'system',
+    `Smoke PASS: enter ok, send ok (broadcasted=${Boolean(sendResult.broadcasted)}), sequence ${beforeSeq} -> ${afterSeq}, marker=${marker}`
+  );
 }
 
 function showSetup() {
@@ -498,6 +618,7 @@ async function onCreateIdentity() {
 
     state.identity = result;
     state.encryptedBundle = result.encrypted_bundle;
+    state.passphrase = passphrase;
     state.aliasName = aliasName;
     state.locale = locale;
 
@@ -533,6 +654,7 @@ async function onUnlockIdentity() {
 
     state.identity = updated;
     state.encryptedBundle = updated.encrypted_bundle;
+    state.passphrase = passphrase;
     state.aliasName = aliasName;
     state.locale = locale;
 
@@ -592,8 +714,10 @@ async function applyLocaleChange(localeValue) {
 
 function lockSession() {
   stopHomeEventPolling();
+  disconnect_world().catch(() => {});
   state.identity = null;
   state.encryptedBundle = '';
+  state.passphrase = '';
   state.currentHome = null;
   byId('transcript').innerHTML = '';
   setSetupStatus('Session locked. Bundle remains stored unless removed manually.');
@@ -626,8 +750,8 @@ async function publishDidDocument() {
 function normalizeIrohAddress(address) {
   const value = String(address || '').trim();
   if (!value) return '';
-  if (value.startsWith('iroh:')) {
-    return value.slice(5);
+  if (value.startsWith('/iroh/')) {
+    return value.slice('/iroh/'.length);
   }
   return value;
 }
@@ -636,36 +760,145 @@ function isLikelyIrohAddress(address) {
   return /^[a-f0-9]{64}$/i.test(normalizeIrohAddress(address));
 }
 
+function normalizeRelayUrl(input) {
+  let value = String(input || '').trim();
+  // Remove all trailing dots and slashes
+  while (value.endsWith('.') || value.endsWith('/')) {
+    value = value.slice(0, -1);
+  }
+  // Ensure it ends with a single /
+  return value + '/';
+}
+
 function delay(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-async function enterWorldWithRetry(endpointId, actorName, did, room) {
+function withTimeout(promise, ms, message) {
+  let timer = null;
+  const timeoutPromise = new Promise((_, reject) => {
+    timer = setTimeout(() => reject(new Error(message)), ms);
+  });
+
+  return Promise.race([promise, timeoutPromise]).finally(() => {
+    if (timer) {
+      clearTimeout(timer);
+    }
+  });
+}
+
+async function lookupWorldRelayHint(endpointId) {
+  const lookupStart = Date.now();
+  logger.log('relay.lookup', `fetching status for endpoint ${endpointId.slice(0, 8)}...`);
+  
+  try {
+    const response = await withTimeout(fetch('http://127.0.0.1:5002/status.json'), 1500, 'status fetch timed out');
+    const elapsed = Date.now() - lookupStart;
+    
+    if (!response.ok) {
+      logger.log('relay.lookup', `status fetch returned ${response.status} in ${elapsed}ms`);
+      return null;
+    }
+    
+    const status = await response.json();
+    const world = status && status.world ? status.world : null;
+    
+    if (!world || world.endpoint_id !== endpointId) {
+      logger.log('relay.lookup', `endpoint mismatch in status (expected ${endpointId.slice(0, 8)}..., got ${world?.endpoint_id?.slice(0, 8)}...) in ${elapsed}ms`);
+      return null;
+    }
+    
+    const relayUrls = Array.isArray(world.relay_urls) ? world.relay_urls : [];
+    if (relayUrls.length === 0) {
+      logger.log('relay.lookup', `no relay urls in status in ${elapsed}ms`);
+      return null;
+    }
+    
+    const rawUrl = relayUrls[0];
+    const normalizedUrl = normalizeRelayUrl(rawUrl);
+    logger.log('relay.lookup', `found relay in ${elapsed}ms: raw="${rawUrl}" normalized="${normalizedUrl}"`);
+    
+    return normalizedUrl;
+  } catch (error) {
+    const elapsed = Date.now() - lookupStart;
+    logger.log('relay.lookup', `failed after ${elapsed}ms: ${error instanceof Error ? error.message : String(error)}`);
+    return null;
+  }
+}
+
+async function enterWorldWithRetry(endpointId, actorName, room) {
   const maxAttempts = 3;
   let lastError = null;
+  logger.log('enter.world', `starting enter sequence for endpoint=${endpointId.slice(0, 8)}... actor=${actorName} room=${room}`);
 
   for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+    const attemptStart = Date.now();
+    logger.log(`enter.attempt.${attempt}`, `starting attempt`);
+    
     try {
-      return await enter_world(endpointId, actorName, did, room);
+      // Phase 1: Relay discovery and connection
+      logger.log(`enter.attempt.${attempt}`, `phase 1/2: relay discovery and connect`);
+      const relayHint = await lookupWorldRelayHint(endpointId);
+      
+      if (relayHint) {
+        logger.log(`enter.attempt.${attempt}`, `using relay hint: ${relayHint}`);
+      } else {
+        logger.log(`enter.attempt.${attempt}`, `no relay hint found, falling back to discovery-only`);
+      }
+
+      const connectStart = Date.now();
+      await withTimeout(
+        relayHint
+          ? connect_world_with_relay(endpointId, relayHint)
+          : connect_world(endpointId),
+        17000,
+        'connect phase timed out'
+      );
+      const connectElapsed = Date.now() - connectStart;
+      logger.log(`enter.attempt.${attempt}`, `connected in ${connectElapsed}ms`);
+
+      // Phase 2: World enter request
+      logger.log(`enter.attempt.${attempt}`, `phase 2/2: sending enter request`);
+      const requestStart = Date.now();
+      const response = await withTimeout(
+        enter_world(endpointId, state.passphrase, state.encryptedBundle, actorName, room),
+        12000,
+        'enter request timed out'
+      );
+      const requestElapsed = Date.now() - requestStart;
+      logger.log(`enter.attempt.${attempt}`, `enter request succeeded in ${requestElapsed}ms`);
+      
+      const result = JSON.parse(response);
+      logger.log(`enter.attempt.${attempt}`, `response: ok=${result.ok} room=${result.room} latest_seq=${result.latest_event_sequence || 0} endpoint=${result.endpoint_id?.slice(0, 8)}...`);
+      logger.log(`enter.world`, `success after ${Date.now() - attemptStart}ms total on attempt ${attempt}/${maxAttempts}`);
+      
+      return response;
     } catch (error) {
       lastError = error;
       const message = error instanceof Error ? error.message : String(error);
+      const elapsedTotal = Date.now() - attemptStart;
       const isTimeout = message.includes('timed out');
       const isConnectionLost = message.includes('connection lost');
       const isRetryable = isTimeout || isConnectionLost;
+      
+      logger.log(`enter.attempt.${attempt}`, `failed after ${elapsedTotal}ms: ${message} (retryable=${isRetryable})`);
 
       if (!isRetryable || attempt === maxAttempts) {
+        logger.log('enter.world', `giving up after attempt ${attempt}/${maxAttempts}: ${message}`);
         throw error;
       }
 
+      const backoffMs = 1500 * attempt;
       appendMessage(
         'system',
         `iroh attempt ${attempt}/${maxAttempts} failed (${message}). Retrying...`
       );
-      await delay(1500 * attempt);
+      logger.log(`enter.attempt.${attempt}`, `waiting ${backoffMs}ms before attempt ${attempt + 1}`);
+      await delay(backoffMs);
     }
   }
 
+  logger.log('enter.world', `failed: all ${maxAttempts} attempts exhausted`);
   throw lastError || new Error('iroh connect failed');
 }
 
@@ -676,21 +909,24 @@ async function enterHome(target) {
 
   const alias = String(target || '').trim();
   if (!alias) {
-    throw new Error('Usage: /enter <alias-or-iroh-address>');
+    throw new Error('Usage: /enter </iroh/...|alias>');
   }
 
   const aliasValue = state.aliasBook[alias] || alias;
   const endpointId = normalizeIrohAddress(aliasValue);
+  logger.log('enter.home', `alias=${alias} resolved=${aliasValue} endpoint=${endpointId.slice(0, 8)}...`);
+  
   if (!isLikelyIrohAddress(endpointId)) {
     throw new Error(
-      `Alias ${alias} is not a valid iroh endpoint id (expected 64 hex chars, got ${endpointId.length}).`
+      `Alias ${alias} is not a valid endpoint id (expected 64 hex chars, got ${endpointId.length}).`
     );
   }
 
-  appendMessage('system', `Connecting to ${alias} over iroh...`);
+  appendMessage('system', `Connecting to ${alias}...`);
   const result = JSON.parse(
-    await enterWorldWithRetry(endpointId, state.aliasName, state.identity.did, 'lobby')
+    await enterWorldWithRetry(endpointId, state.aliasName, 'lobby')
   );
+  logger.log('enter.home', `result ok=${result.ok} room=${result.room} endpoint=${result.endpoint_id?.slice(0, 8)}... latest_seq=${result.latest_event_sequence || 0}`);
 
   state.currentHome = {
     alias,
@@ -705,7 +941,7 @@ async function enterHome(target) {
   appendMessage('system', `Entered ${alias}.`);
   appendMessage('system', `Home endpoint: ${result.endpoint_id}`);
   appendMessage('system', `Current room: ${result.room}`);
-  appendMessage('system', result.message || 'Connected to home over iroh.');
+  appendMessage('system', result.message || 'Connected to home.');
 }
 
 async function sendCurrentWorldMessage(text) {
@@ -714,16 +950,23 @@ async function sendCurrentWorldMessage(text) {
     return;
   }
 
+  const sendStart = Date.now();
+  logger.log('send.message', `room=${state.currentHome.room} to=${state.currentHome.alias} actor=${state.aliasName} msg_len=${text.length}`);
+  
   const result = JSON.parse(
     await send_world_message(
       state.currentHome.endpointId,
+      state.passphrase,
+      state.encryptedBundle,
       state.aliasName,
-      state.identity.did,
       state.currentHome.room,
       state.locale,
       text
     )
   );
+  const elapsed = Date.now() - sendStart;
+  logger.log('send.message', `response ok=${result.ok} broadcasted=${result.broadcasted} latest_seq=${result.latest_event_sequence || 0} in ${elapsed}ms`);
+  
   if (!result.broadcasted) {
     state.currentHome.lastEventSequence = toSequenceNumber(
       result.latest_event_sequence || state.currentHome.lastEventSequence || 0
@@ -752,9 +995,11 @@ function parseSlash(input) {
     appendMessage('system', '  alias <name> <address>     - same as /alias');
     appendMessage('system', '  /unalias <name>            - remove a saved alias');
     appendMessage('system', '  /aliases                   - list saved aliases');
-    appendMessage('system', '  /enter <iroh:...|alias>    - enter a home by iroh endpoint id or alias');
+    appendMessage('system', '  /enter </iroh/...|alias>   - enter a home by endpoint id or alias');
+    appendMessage('system', '  /smoke [alias]             - run enter + send + poll smoke test');
     appendMessage('system', '  /locale <en|nb-NO>         - change actor language for this alias');
     appendMessage('system', '  /publish                   - publish DID document to IPNS');
+    appendMessage('system', '  /debug [on|off]            - toggle debug logs in transcript');
     appendMessage('system', 'Messaging:');
     appendMessage('system', '  Hello world                - room chatter');
     appendMessage('system', `  @${labels.here} ${labels.who}                  - room command: list actors in room`);
@@ -862,13 +1107,41 @@ function parseSlash(input) {
     return true;
   }
 
+  if (cmd === '/debug') {
+    if (rest.length === 0) {
+      setDebugMode(!state.debug);
+    } else {
+      const mode = String(rest[0] || '').trim().toLowerCase();
+      if (mode === 'on' || mode === '1' || mode === 'true') {
+        setDebugMode(true);
+      } else if (mode === 'off' || mode === '0' || mode === 'false') {
+        setDebugMode(false);
+      } else {
+        appendMessage('system', 'Usage: /debug [on|off]');
+        return true;
+      }
+    }
+    return true;
+  }
+
   if (cmd === '/enter') {
     if (rest.length !== 1) {
-      appendMessage('system', 'Usage: /enter <alias-or-iroh-address>');
+      appendMessage('system', 'Usage: /enter </iroh/...|alias>');
       return true;
     }
     enterHome(rest[0]).catch((err) => {
       appendMessage('system', `Enter failed: ${err instanceof Error ? err.message : String(err)}`);
+    });
+    return true;
+  }
+
+  if (cmd === '/smoke') {
+    if (rest.length > 1) {
+      appendMessage('system', 'Usage: /smoke [alias]');
+      return true;
+    }
+    runSmokeTest(rest[0]).catch((err) => {
+      appendMessage('system', `Smoke failed: ${err instanceof Error ? err.message : String(err)}`);
     });
     return true;
   }
@@ -954,6 +1227,7 @@ function restoreSavedValues() {
   }
 
   state.aliasBook = loadAliasBook();
+  state.debug = readStoredDebugFlag();
 }
 
 async function main() {

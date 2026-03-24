@@ -949,7 +949,8 @@ pub fn set_bundle_locale(
     locale: &str,
 ) -> Result<String, JsValue> {
     update_bundle_document(passphrase, encrypted_bundle_json, |document| {
-        document.set_locale(canonical_locale(locale)).map_err(js_err)
+        let canonical = canonical_locale(locale);
+        document.set_locale(&canonical).map_err(js_err)
     })
 }
 
@@ -1192,13 +1193,14 @@ pub async fn send_world_message(
     text: &str,
 ) -> Result<String, JsValue> {
     let timestamp_ms = js_sys::Date::now() as u64;
+    let canonical = canonical_locale(locale);
     let request = build_signed_world_request(
         passphrase,
         encrypted_bundle_json,
         actor_name,
         WorldCommand::Message {
             room: room.trim().to_string(),
-            envelope: parse_message_with_locale(text, canonical_locale(locale)),
+            envelope: parse_message_with_locale(text, &canonical),
         },
         timestamp_ms,
     )?;

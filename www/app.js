@@ -42,8 +42,8 @@ const LEGACY_ALIAS_KEY = 'ma.identity.v2.alias';
 const DEFAULT_LOCALE = 'en';
 
 const LOCALE_LABELS = {
-  en: { label: 'English', here: 'here', me: 'me', say: 'say', who: 'who' },
-  'nb-NO': { label: 'Norsk bokmal', here: 'her', me: 'meg', say: 'si', who: 'hvem' }
+  en: { label: 'English' },
+  'nb-NO': { label: 'Norsk bokmal' }
 };
 const ROOM_POLL_INTERVAL_MS = 1500;
 const DID_DOC_CACHE_TTL_MS = 60_000;
@@ -368,10 +368,6 @@ const identityStore = createIdentityStore({
   isValidAliasName,
   normalizeLocale
 });
-
-function localeLabels() {
-  return LOCALE_LABELS[state.locale] || LOCALE_LABELS[DEFAULT_LOCALE];
-}
 
 function setLanguageSelection(value) {
   const locale = normalizeLocale(value);
@@ -1044,28 +1040,44 @@ async function sendCurrentWorldMessage(text) {
     return;
   }
 
-  // Standard chat UX: @target message defaults to whisper.
-  // Legacy actor grammar still works for @here/@me/@radio commands.
-  if (text.trim().startsWith('@')) {
-    const mention = text.trim().match(/^@(\S+)\s+(.+)$/);
-    if (mention) {
-      const target = mention[1];
-      let payload = mention[2].trim();
-      if (/^say\s+/i.test(payload)) {
-        payload = payload.replace(/^say\s+/i, '').trim();
-      }
+  const trimmedText = text.trim();
 
-      const normalized = target.toLowerCase();
-      const isLegacyTarget = ['here', 'her', 'room', 'world', 'me', 'meg', 'radio'].includes(normalized);
-      if (!isLegacyTarget && payload) {
+  // Generic actor message-passing syntax: @target with explicit message type.
+  // @target 'payload     -> x-ma-chat whisper (everything after ' is payload)
+  // @target command args -> generic command message (opaque to client, parsed server-side)
+  // @target              -> no-op, output "?"
+  if (trimmedText.startsWith('@')) {
+    const trimmed = trimmedText;
+    const spaceIdx = trimmed.indexOf(' ');
+    
+    if (spaceIdx === -1) {
+      // Just "@target" with nothing after
+      appendMessage('system', '?');
+      return;
+    }
+
+    const target = trimmed.substring(1, spaceIdx);
+    const remainder = trimmed.substring(spaceIdx + 1);
+
+    if (remainder.startsWith("'")) {
+      const payload = remainder.substring(1); // Everything after the '
+      try {
         await sendWhisperToDid(target, payload);
-        appendMessage('system', `Whisper sent to ${target}.`);
+        appendMessage('system', `Chat sent to ${target}.`);
+        return;
+      } catch (err) {
+        appendMessage('system', `Error sending chat to ${target}: ${err.message}`);
         return;
       }
     }
 
+    if (!remainder.trim()) {
+      appendMessage('system', '?');
+      return;
+    }
+
     const sendStart = Date.now();
-    logger.log('send.message', `legacy envelope room=${state.currentHome.room} to=${state.currentHome.alias} actor=${state.aliasName} msg_len=${text.length}`);
+    logger.log('send.command', `room=${state.currentHome.room} actor=${state.aliasName} msg_len=${trimmed.length}`);
     const result = JSON.parse(
       await send_world_message(
         state.currentHome.endpointId,
@@ -1074,11 +1086,11 @@ async function sendCurrentWorldMessage(text) {
         state.aliasName,
         state.currentHome.room,
         state.locale,
-        text
+        trimmed
       )
     );
     const elapsed = Date.now() - sendStart;
-    logger.log('send.message', `legacy response ok=${result.ok} broadcasted=${result.broadcasted} latest_seq=${result.latest_event_sequence || 0} in ${elapsed}ms`);
+    logger.log('send.command', `response ok=${result.ok} broadcasted=${result.broadcasted} latest_seq=${result.latest_event_sequence || 0} in ${elapsed}ms`);
 
     if (!result.ok) {
       throw new Error(result.message || 'send failed');
@@ -1129,19 +1141,19 @@ async function sendCurrentWorldMessage(text) {
 
 async function sendWhisperToDid(targetDidOrAlias, text) {
   if (!state.identity || !state.currentHome) {
-    throw new Error('Join a home before sending whispers.');
+    throw new Error('Join a home before sending chat.');
   }
 
   const key = String(targetDidOrAlias || '').trim();
   if (!key) {
-    throw new Error('Usage: /whisper <did-or-alias> <message>');
+    throw new Error('Usage: @target \'<message>');
   }
 
   const resolved = resolveAliasInput(key);
   const mappedDid = state.handleDidMap[key] || state.handleDidMap[resolved] || '';
   const targetDid = mappedDid || findDidByEndpoint(resolved) || resolved;
   if (!String(targetDid).startsWith('did:ma:')) {
-    throw new Error(`Whisper target must be a did:ma: DID, alias, or known handle mapped to a DID. Got: ${targetDid}`);
+    throw new Error(`Chat target must be a did:ma: DID, alias, or known handle mapped to a DID. Got: ${targetDid}`);
   }
 
   const recipientDocumentJson = await fetchDidDocumentJsonByDid(targetDid);
@@ -1170,7 +1182,6 @@ function parseSlash(input) {
   }
 
   if (cmd === '/help') {
-    const labels = localeLabels();
     appendMessage('system', 'Commands:');
     appendMessage('system', '  /help                      - this message');
     appendMessage('system', '  /identity                  - show current identity details');
@@ -1180,17 +1191,17 @@ function parseSlash(input) {
     appendMessage('system', '  /aliases                   - list saved aliases');
     appendMessage('system', '  /enter </iroh/...|alias>   - enter a home by endpoint id or alias');
     appendMessage('system', '  /smoke [alias]             - run enter + send + poll smoke test');
-    appendMessage('system', '  /whisper <did|alias> <msg> - send E2E whisper (application/x-ma-whisper)');
     appendMessage('system', '  /locale <en|nb-NO>         - change actor language for this alias');
     appendMessage('system', '  /publish                   - publish DID document to IPNS');
     appendMessage('system', '  /debug [on|off]            - toggle debug logs in transcript');
     appendMessage('system', 'Messaging:');
     appendMessage('system', '  Hello world                - room chatter (renders as did-or-alias: text)');
-    appendMessage('system', '  @name hello                - whisper shortcut (E2E)');
-    appendMessage('system', `  @name ${labels.say} hello            - whisper shortcut (E2E)`);
-    appendMessage('system', `  @${labels.here} ${labels.who}                  - room command: list actors in room`);
-    appendMessage('system', `  @${labels.me} ${labels.say} "hello"            - legacy self actor command`);
-    appendMessage('system', '  @radio turn on             - legacy radio actor command');
+    appendMessage('system', "  @target 'message           - send chat to actor (E2E, explicit message type)");
+    appendMessage('system', '  @target command args       - send command to actor (opaque, parsed server-side)');
+    appendMessage('system', '  @target                    - no-op (outputs ?)');
+    appendMessage('system', '  who                        - room command (same as @here who)');
+    appendMessage('system', '  l                          - room listing (same as @here l)');
+    appendMessage('system', '  @avatar describe "..."     - update your avatar description');
     return true;
   }
 
@@ -1328,25 +1339,6 @@ function parseSlash(input) {
     runSmokeTest(rest[0]).catch((err) => {
       appendMessage('system', `Smoke failed: ${err instanceof Error ? err.message : String(err)}`);
     });
-    return true;
-  }
-
-  if (cmd === '/whisper' || cmd === '/w') {
-    if (rest.length < 2) {
-      appendMessage('system', 'Usage: /whisper <did|alias> <message>');
-      return true;
-    }
-    const target = rest[0];
-    const payload = rest.slice(1).join(' ').trim();
-    if (!payload) {
-      appendMessage('system', 'Usage: /whisper <did|alias> <message>');
-      return true;
-    }
-    sendWhisperToDid(target, payload)
-      .then(() => appendMessage('system', `Whisper sent to ${humanizeIdentifier(target)}.`))
-      .catch((err) => {
-        appendMessage('system', humanizeText(`Whisper failed: ${err instanceof Error ? err.message : String(err)}`));
-      });
     return true;
   }
 

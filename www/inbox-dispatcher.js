@@ -44,11 +44,14 @@ export function createInboundDispatcher(deps) {
   }
 
   function shouldSuppressInboundEcho(evt) {
+    const currentDid = String(state.identity?.did || '').trim();
+    const currentRootDid = didRoot(currentDid);
+    const senderRootDid = didRoot(evt.senderDid || '');
     return Boolean(
       (evt.kind === 'speech' || evt.kind === 'chat') &&
-        evt.senderHandle &&
-        state.aliasName &&
-        evt.senderHandle === state.aliasName
+        senderRootDid &&
+        currentRootDid &&
+        senderRootDid === currentRootDid
     );
   }
 
@@ -114,7 +117,7 @@ export function createInboundDispatcher(deps) {
 
   async function handleInboundSpeech(evt) {
     if (!evt.text) return;
-    writeDialogWorld(evt.text);
+    writeDialogChat(evt.senderDid, evt.senderHandle, evt.text);
   }
 
   async function handleInboundDefault(evt) {

@@ -1,8 +1,9 @@
 .PHONY: build serve publish-ipfs clean distclean
 
-ACTOR_RS := $(shell find src -type f -name '*.rs')
+HOME_RS := $(shell find src -type f -name '*.rs')
 DID_MA_RS := $(shell find ../ma/src -type f -name '*.rs')
-BUILD_INPUTS := Cargo.toml Cargo.lock ../ma/Cargo.toml ../ma/Cargo.lock $(ACTOR_RS) $(DID_MA_RS)
+MA_ACTOR_RS := $(shell find ../ma-actor/src -type f -name '*.rs')
+BUILD_INPUTS := Makefile Cargo.toml Cargo.lock ../ma/Cargo.toml ../ma/Cargo.lock ../ma-actor/Cargo.toml $(HOME_RS) $(DID_MA_RS) $(MA_ACTOR_RS)
 
 PKG_STAMP := www/pkg/.stamp
 

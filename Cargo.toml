@@ -13,7 +13,7 @@ wasm-bindgen-futures = "0.4"
 tokio = { version = "1.37", features = ["io-util", "sync"] }
 
 did-ma = { path = "../ma" }
-ma-actor-core = { path = "../ma-actor-core" }
+ma-actor = { path = "../ma-actor" }
 iroh = { version = "0.97.0" }
 
 argon2 = { version = "0.5", default-features = false, features = ["alloc"] }

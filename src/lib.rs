@@ -256,7 +256,7 @@ async fn exchange_on_stream(cache: &mut WorldConnCache, request: &WorldRequest) 
 
     serde_json::from_slice(&response_bytes).map_err(js_err)
 }
-use ma_actor_core::{
+use ma_actor::{
     canonical_locale,
     did_root as core_did_root,
     find_alias_for_address as core_find_alias_for_address,
@@ -328,7 +328,7 @@ enum WorldCommand {
     Enter { room: Option<String>, preferred_handle: Option<String> },
     Message {
         room: String,
-        envelope: ma_actor_core::MessageEnvelope,
+        envelope: ma_actor::MessageEnvelope,
     },
     RoomEvents {
         room: String,

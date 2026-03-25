@@ -4,14 +4,9 @@ export function createDialogWriter({ byId, displayActor }) {
     const row = document.createElement('div');
     row.className = `msg ${role}`;
 
-    const label = document.createElement('span');
-    label.className = 'msg-role';
-    label.textContent = role;
-
     const text = document.createElement('p');
     text.textContent = message;
 
-    row.appendChild(label);
     row.appendChild(text);
     transcript.appendChild(row);
     transcript.scrollTop = transcript.scrollHeight;

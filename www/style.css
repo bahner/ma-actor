@@ -210,19 +210,13 @@ button.primary {
   border-radius: 14px;
   padding: 0.75rem;
   background: rgba(255, 251, 243, 0.9);
+  display: flex;
+  flex-direction: column;
+  gap: 0.2rem;
 }
 
 .msg {
-  margin-bottom: 0.7rem;
-}
-
-.msg-role {
-  display: inline-block;
-  font-size: 0.69rem;
-  color: #857763;
-  margin-bottom: 0.18rem;
-  text-transform: uppercase;
-  letter-spacing: 0.06em;
+  margin: 0;
 }
 
 .msg p {
@@ -230,6 +224,10 @@ button.primary {
   white-space: pre-wrap;
   word-break: break-word;
   line-height: 1.42;
+}
+
+.msg.system p {
+  color: #1f5da8;
 }
 
 .composer {

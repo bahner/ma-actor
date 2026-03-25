@@ -819,10 +819,20 @@ function displayActor(senderDid, senderHandle) {
   const root = didRoot(fullDid);
   const alias = findAliasForAddress(fullDid) || findAliasForAddress(root) || '';
   if (alias) return alias;
-  if (senderHandle) return senderHandle;
   if (fullDid) return fullDid;
   if (root) return root;
+  if (senderHandle) return senderHandle;
   return 'unknown';
+}
+
+function currentActorDid() {
+  return String(state.identity?.did || '').trim();
+}
+
+function renderLocalBroadcastMessage(text) {
+  const senderDid = currentActorDid();
+  const actor = displayActor(senderDid, state.aliasName);
+  appendMessage('world', humanizeText(`${actor}: ${text}`));
 }
 
 function isLikelyIrohAddress(address) {
@@ -1042,6 +1052,40 @@ async function sendCurrentWorldMessage(text) {
 
   const trimmedText = text.trim();
 
+  if (trimmedText.startsWith('@@')) {
+    const sendStart = Date.now();
+    logger.log('send.command', `room=${state.currentHome.room} actor=${state.aliasName} msg_len=${trimmedText.length}`);
+
+    const result = JSON.parse(
+      await send_world_message(
+        state.currentHome.endpointId,
+        state.passphrase,
+        state.encryptedBundle,
+        state.aliasName,
+        state.currentHome.room,
+        state.locale,
+        trimmedText
+      )
+    );
+    const elapsed = Date.now() - sendStart;
+    logger.log('send.command', `response ok=${result.ok} broadcasted=${result.broadcasted} latest_seq=${result.latest_event_sequence || 0} in ${elapsed}ms`);
+
+    if (!result.ok) {
+      throw new Error(result.message || 'send failed');
+    }
+
+    if (!result.broadcasted) {
+      state.currentHome.lastEventSequence = toSequenceNumber(
+        result.latest_event_sequence || state.currentHome.lastEventSequence || 0
+      );
+      appendMessage('world', result.message || '(no response)');
+      return;
+    }
+
+    await pollCurrentHomeEvents();
+    return;
+  }
+
   // Generic actor message-passing syntax: @target with explicit message type.
   // @target 'payload     -> x-ma-chat whisper (everything after ' is payload)
   // @target command args -> generic command message (opaque to client, parsed server-side)
@@ -1109,23 +1153,24 @@ async function sendCurrentWorldMessage(text) {
   }
 
   const sendStart = Date.now();
-  logger.log('send.chat', `room=${state.currentHome.room} to=${state.currentHome.alias} actor=${state.aliasName} msg_len=${text.length}`);
-  
+  logger.log('send.command', `room=${state.currentHome.room} actor=${state.aliasName} msg_len=${trimmedText.length}`);
+
   const result = JSON.parse(
-    await send_world_chat(
+    await send_world_message(
       state.currentHome.endpointId,
       state.passphrase,
       state.encryptedBundle,
       state.aliasName,
       state.currentHome.room,
-      text
+      state.locale,
+      trimmedText
     )
   );
   const elapsed = Date.now() - sendStart;
-  logger.log('send.chat', `response ok=${result.ok} broadcasted=${result.broadcasted} latest_seq=${result.latest_event_sequence || 0} in ${elapsed}ms`);
+  logger.log('send.command', `response ok=${result.ok} broadcasted=${result.broadcasted} latest_seq=${result.latest_event_sequence || 0} in ${elapsed}ms`);
 
   if (!result.ok) {
-    throw new Error(result.message || 'chat send failed');
+    throw new Error(result.message || 'send failed');
   }
   
   if (!result.broadcasted) {
@@ -1136,6 +1181,9 @@ async function sendCurrentWorldMessage(text) {
     return;
   }
 
+  if (trimmedText.startsWith("'")) {
+    renderLocalBroadcastMessage(trimmedText.substring(1));
+  }
   await pollCurrentHomeEvents();
 }
 
@@ -1195,7 +1243,8 @@ function parseSlash(input) {
     appendMessage('system', '  /publish                   - publish DID document to IPNS');
     appendMessage('system', '  /debug [on|off]            - toggle debug logs in transcript');
     appendMessage('system', 'Messaging:');
-    appendMessage('system', '  Hello world                - room chatter (renders as did-or-alias: text)');
+    appendMessage('system', '  command                    - command to your avatar (e.g. go north, who)');
+    appendMessage('system', "  'Hello world               - shorthand for @avatar say Hello world");
     appendMessage('system', "  @target 'message           - send chat to actor (E2E, explicit message type)");
     appendMessage('system', '  @target command args       - send command to actor (opaque, parsed server-side)');
     appendMessage('system', '  @target                    - no-op (outputs ?)');
@@ -1355,8 +1404,6 @@ function onCommandSubmit(event) {
   state.commandHistory.push(text);
   state.historyIndex = -1;
   state.historyDraft = '';
-
-  appendMessage('you', text);
 
   if (text.startsWith('/')) {
     const handled = parseSlash(text);

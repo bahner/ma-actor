@@ -12,7 +12,7 @@ use did_ma::{
     Did, Document, EncryptionKey, Message, SigningKey, VerificationMethod,
 };
 use iroh::{
-    Endpoint, EndpointAddr, EndpointId, RelayUrl,
+    Endpoint, EndpointAddr, EndpointId, RelayUrl, SecretKey,
     endpoint::{Connection, RecvStream, SendStream, presets},
     protocol::{AcceptError, ProtocolHandler, Router},
 };
@@ -37,6 +37,137 @@ fn normalize_relay_url(input: &str) -> String {
     value
 }
 
+fn endpoint_id_from_address(input: &str) -> Option<String> {
+    let value = input.trim();
+    if value.is_empty() {
+        return None;
+    }
+
+    for prefix in ["/ma-iroh/", "/iroh+ma/", "/iroh/"] {
+        if let Some(rest) = value.strip_prefix(prefix) {
+            let endpoint = rest.split('/').next().unwrap_or_default().trim();
+            if endpoint.is_empty() {
+                return None;
+            }
+            if endpoint.parse::<EndpointId>().is_ok() {
+                return Some(endpoint.to_string());
+            }
+            return None;
+        }
+    }
+
+    if value.parse::<EndpointId>().is_ok() {
+        return Some(value.to_string());
+    }
+
+    None
+}
+
+fn endpoint_id_from_transport_value(value: &serde_json::Value) -> Option<String> {
+    match value {
+        serde_json::Value::String(s) => endpoint_id_from_address(s),
+        serde_json::Value::Object(map) => {
+            for key in [
+                "endpoint_id",
+                "endpointId",
+                "iroh",
+                "address",
+                "currentInbox",
+                "current_inbox",
+                "presenceHint",
+                "presence_hint",
+            ] {
+                if let Some(serde_json::Value::String(s)) = map.get(key) {
+                    if let Some(endpoint) = endpoint_id_from_address(s) {
+                        return Some(endpoint);
+                    }
+                }
+            }
+            None
+        }
+        _ => None,
+    }
+}
+
+fn recipient_inbox_endpoint_id(document: &Document) -> Result<String, JsValue> {
+    if let Some(ma) = document.ma.as_ref() {
+        if let Some(current) = ma.current_inbox.as_deref() {
+            if let Some(endpoint) = endpoint_id_from_address(current) {
+                return Ok(endpoint);
+            }
+        }
+
+        if let Some(hint) = ma.presence_hint.as_deref() {
+            if let Some(endpoint) = endpoint_id_from_address(hint) {
+                return Ok(endpoint);
+            }
+        }
+
+        if let Some(transports) = ma.transports.as_ref() {
+            if let Some(items) = transports.as_array() {
+                for item in items {
+                    if let Some(endpoint) = endpoint_id_from_transport_value(item) {
+                        return Ok(endpoint);
+                    }
+                }
+            } else if let Some(endpoint) = endpoint_id_from_transport_value(transports) {
+                return Ok(endpoint);
+            }
+        }
+    }
+
+    Err(js_err("recipient DID document has no usable inbox transport endpoint"))
+}
+
+async fn send_inbox_signed_message(target_endpoint_id: &str, message_cbor: Vec<u8>) -> Result<InboxResponse, JsValue> {
+    let target: EndpointId = target_endpoint_id
+        .trim()
+        .parse()
+        .map_err(|e| js_err(format!("invalid recipient endpoint id: {e}")))?;
+
+    let endpoint = Endpoint::builder(presets::N0)
+        .bind()
+        .await
+        .map_err(|e| js_err(format!("sender endpoint bind failed: {e}")))?;
+    let _ = endpoint.online().await;
+
+    let relay_source = normalize_relay_url(DEFAULT_WORLD_RELAY_URL);
+    let relay_url: RelayUrl = relay_source
+        .parse()
+        .map_err(|e| js_err(format!("relay URL parse failed for '{}': {}", relay_source, e)))?;
+
+    let endpoint_addr = EndpointAddr::new(target).with_relay_url(relay_url);
+    let connection = endpoint
+        .connect(endpoint_addr, INBOX_ALPN)
+        .await
+        .map_err(|e| js_err(format!("inbox endpoint.connect() failed: {}", e)))?;
+
+    let (mut send, mut recv) = connection
+        .open_bi()
+        .await
+        .map_err(|e| js_err(format!("inbox connection.open_bi() failed: {}", e)))?;
+
+    let request = InboxRequest::Signed { message_cbor };
+    let payload = serde_json::to_vec(&request).map_err(js_err)?;
+
+    send.write_u32(payload.len() as u32).await.map_err(js_err)?;
+    send.write_all(&payload).await.map_err(js_err)?;
+    send.flush().await.map_err(js_err)?;
+
+    let frame_len = recv.read_u32().await.map_err(js_err)? as usize;
+    if frame_len > 256 * 1024 {
+        return Err(js_err(format!("inbox response frame too large: {}", frame_len)));
+    }
+    let mut bytes = vec![0u8; frame_len];
+    recv.read_exact(&mut bytes).await.map_err(js_err)?;
+
+    let _ = send.finish();
+    connection.close(0u32.into(), b"ok");
+    endpoint.close().await;
+
+    serde_json::from_slice::<InboxResponse>(&bytes).map_err(js_err)
+}
+
 struct WorldConnCache {
     endpoint: Endpoint,
     connection: Connection,
@@ -45,20 +176,51 @@ struct WorldConnCache {
     target_id: String,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WorldTransportKind {
+    World,
+    Cmd,
+    Chat,
+}
+
+impl WorldTransportKind {
+    fn alpn(self) -> &'static [u8] {
+        match self {
+            WorldTransportKind::World => WORLD_ALPN,
+            WorldTransportKind::Cmd => CMD_ALPN,
+            WorldTransportKind::Chat => CHAT_ALPN,
+        }
+    }
+}
+
 thread_local! {
-    static CONN_CACHE: RefCell<Option<WorldConnCache>> = RefCell::new(None);
+    static WORLD_CONN_CACHE: RefCell<Option<WorldConnCache>> = RefCell::new(None);
+    static CMD_CONN_CACHE: RefCell<Option<WorldConnCache>> = RefCell::new(None);
+    static CHAT_CONN_CACHE: RefCell<Option<WorldConnCache>> = RefCell::new(None);
 }
 
-fn take_conn_cache() -> Option<WorldConnCache> {
-    CONN_CACHE.with(|c| c.borrow_mut().take())
+fn take_conn_cache(kind: WorldTransportKind) -> Option<WorldConnCache> {
+    match kind {
+        WorldTransportKind::World => WORLD_CONN_CACHE.with(|c| c.borrow_mut().take()),
+        WorldTransportKind::Cmd => CMD_CONN_CACHE.with(|c| c.borrow_mut().take()),
+        WorldTransportKind::Chat => CHAT_CONN_CACHE.with(|c| c.borrow_mut().take()),
+    }
 }
 
-fn store_conn_cache(cache: WorldConnCache) {
-    CONN_CACHE.with(|c| *c.borrow_mut() = Some(cache));
+fn store_conn_cache(kind: WorldTransportKind, cache: WorldConnCache) {
+    match kind {
+        WorldTransportKind::World => WORLD_CONN_CACHE.with(|c| *c.borrow_mut() = Some(cache)),
+        WorldTransportKind::Cmd => CMD_CONN_CACHE.with(|c| *c.borrow_mut() = Some(cache)),
+        WorldTransportKind::Chat => CHAT_CONN_CACHE.with(|c| *c.borrow_mut() = Some(cache)),
+    }
 }
 
-fn clear_conn_cache() {
-    CONN_CACHE.with(|c| *c.borrow_mut() = None);
+fn clear_conn_cache(kind: WorldTransportKind) {
+    match kind {
+        WorldTransportKind::World => WORLD_CONN_CACHE.with(|c| *c.borrow_mut() = None),
+        WorldTransportKind::Cmd => CMD_CONN_CACHE.with(|c| *c.borrow_mut() = None),
+        WorldTransportKind::Chat => CHAT_CONN_CACHE.with(|c| *c.borrow_mut() = None),
+    }
 }
 
 fn with_inbox_state<T>(f: impl FnOnce(&Option<InboxListenerState>) -> T) -> T {
@@ -132,12 +294,13 @@ impl ProtocolHandler for InboxProtocol {
     }
 }
 
-async fn ensure_inbox_listener() -> Result<String, JsValue> {
+async fn ensure_inbox_listener_with_secret(secret_key: SecretKey) -> Result<String, JsValue> {
     if let Some(existing_id) = with_inbox_state(|state| state.as_ref().map(|s| s.endpoint.id().to_string())) {
         return Ok(existing_id);
     }
 
     let endpoint = Endpoint::builder(presets::N0)
+        .secret_key(secret_key)
         .bind()
         .await
         .map_err(|e| js_err(format!("inbox endpoint bind failed: {e}")))?;
@@ -148,7 +311,7 @@ async fn ensure_inbox_listener() -> Result<String, JsValue> {
     };
 
     let router = Router::builder(endpoint.clone())
-        .accept(HOME_INBOX_ALPN, protocol)
+        .accept(INBOX_ALPN, protocol)
         .spawn();
 
     let endpoint_id = endpoint.id().to_string();
@@ -161,7 +324,11 @@ async fn ensure_inbox_listener() -> Result<String, JsValue> {
     Ok(endpoint_id)
 }
 
-async fn create_stream_cache(target_id_str: &str, relay_hint: Option<&str>) -> Result<WorldConnCache, JsValue> {
+async fn create_stream_cache(
+    target_id_str: &str,
+    relay_hint: Option<&str>,
+    kind: WorldTransportKind,
+) -> Result<WorldConnCache, JsValue> {
     let target: EndpointId = target_id_str
         .trim()
         .parse()
@@ -187,7 +354,7 @@ async fn create_stream_cache(target_id_str: &str, relay_hint: Option<&str>) -> R
         }
     }
 
-    let connection = endpoint.connect(endpoint_addr, WORLD_ALPN)
+    let connection = endpoint.connect(endpoint_addr, kind.alpn())
         .await
         .map_err(|e| js_err(format!("endpoint.connect() failed: {}", e)))?;
     
@@ -204,8 +371,11 @@ async fn create_stream_cache(target_id_str: &str, relay_hint: Option<&str>) -> R
     })
 }
 
-async fn get_or_create_stream_cache(target_id_str: &str) -> Result<WorldConnCache, JsValue> {
-    if let Some(cached) = take_conn_cache() {
+async fn get_or_create_stream_cache(
+    target_id_str: &str,
+    kind: WorldTransportKind,
+) -> Result<WorldConnCache, JsValue> {
+    if let Some(cached) = take_conn_cache(kind) {
         if cached.target_id == target_id_str {
             return Ok(cached);
         }
@@ -213,7 +383,7 @@ async fn get_or_create_stream_cache(target_id_str: &str) -> Result<WorldConnCach
         cached.endpoint.close().await;
     }
 
-    create_stream_cache(target_id_str, None).await
+    create_stream_cache(target_id_str, None, kind).await
 }
 
 async fn exchange_on_stream(cache: &mut WorldConnCache, request: &WorldRequest) -> Result<WorldResponse, JsValue> {
@@ -288,6 +458,8 @@ struct IdentityBundlePlain {
     ipns: String,
     signing_private_key_hex: String,
     encryption_private_key_hex: String,
+    #[serde(default)]
+    iroh_secret_key_hex: Option<String>,
     document: Document,
 }
 
@@ -383,7 +555,9 @@ struct WorldActionResult {
 }
 
 const WORLD_ALPN: &[u8] = b"ma/world/1";
-const HOME_INBOX_ALPN: &[u8] = b"ma/home/inbox/1";
+const CMD_ALPN: &[u8] = b"ma/cmd/1";
+const CHAT_ALPN: &[u8] = b"ma/chat/1";
+const INBOX_ALPN: &[u8] = b"ma/inbox/1";
 const WORLD_TARGET_DID: &str = "did:ma:world";
 const MAX_INBOX_EVENTS: usize = 256;
 
@@ -522,17 +696,17 @@ fn decrypt_bundle(passphrase: &str, bundle: &EncryptedIdentityBundle) -> Result<
 async fn send_world_request(endpoint_id: &str, request: WorldRequest) -> Result<WorldResponse, JsValue> {
     let mut last_error: Option<JsValue> = None;
     for _ in 0..2 {
-        let mut cache = get_or_create_stream_cache(endpoint_id).await?;
+        let mut cache = get_or_create_stream_cache(endpoint_id, WorldTransportKind::World).await?;
         match exchange_on_stream(&mut cache, &request).await {
             Ok(response) => {
-                store_conn_cache(cache);
+                store_conn_cache(WorldTransportKind::World, cache);
                 return Ok(response);
             }
             Err(err) => {
                 last_error = Some(err);
                 cache.connection.close(0u32.into(), b"stream error");
                 cache.endpoint.close().await;
-                clear_conn_cache();
+                clear_conn_cache(WorldTransportKind::World);
             }
         }
     }
@@ -540,10 +714,62 @@ async fn send_world_request(endpoint_id: &str, request: WorldRequest) -> Result<
     Err(last_error.unwrap_or_else(|| js_err("world request failed")))
 }
 
+async fn send_world_cmd_request(endpoint_id: &str, request: WorldRequest) -> Result<WorldResponse, JsValue> {
+    let mut last_error: Option<JsValue> = None;
+    for _ in 0..2 {
+        let mut cache = get_or_create_stream_cache(endpoint_id, WorldTransportKind::Cmd).await?;
+        match exchange_on_stream(&mut cache, &request).await {
+            Ok(response) => {
+                store_conn_cache(WorldTransportKind::Cmd, cache);
+                return Ok(response);
+            }
+            Err(err) => {
+                last_error = Some(err);
+                cache.connection.close(0u32.into(), b"stream error");
+                cache.endpoint.close().await;
+                clear_conn_cache(WorldTransportKind::Cmd);
+            }
+        }
+    }
+
+    Err(last_error.unwrap_or_else(|| js_err("world cmd request failed")))
+}
+
+async fn send_world_chat_request(endpoint_id: &str, request: WorldRequest) -> Result<WorldResponse, JsValue> {
+    let mut last_error: Option<JsValue> = None;
+    for _ in 0..2 {
+        let mut cache = get_or_create_stream_cache(endpoint_id, WorldTransportKind::Chat).await?;
+        match exchange_on_stream(&mut cache, &request).await {
+            Ok(response) => {
+                store_conn_cache(WorldTransportKind::Chat, cache);
+                return Ok(response);
+            }
+            Err(err) => {
+                last_error = Some(err);
+                cache.connection.close(0u32.into(), b"stream error");
+                cache.endpoint.close().await;
+                clear_conn_cache(WorldTransportKind::Chat);
+            }
+        }
+    }
+
+    Err(last_error.unwrap_or_else(|| js_err("world chat request failed")))
+}
+
 /// Close and drop the cached world connection (call on lock/logout).
 #[wasm_bindgen]
 pub async fn disconnect_world() {
-    if let Some(cached) = take_conn_cache() {
+    if let Some(cached) = take_conn_cache(WorldTransportKind::World) {
+        cached.connection.close(0u32.into(), b"bye");
+        cached.endpoint.close().await;
+    }
+
+    if let Some(cached) = take_conn_cache(WorldTransportKind::Cmd) {
+        cached.connection.close(0u32.into(), b"bye");
+        cached.endpoint.close().await;
+    }
+
+    if let Some(cached) = take_conn_cache(WorldTransportKind::Chat) {
         cached.connection.close(0u32.into(), b"bye");
         cached.endpoint.close().await;
     }
@@ -558,8 +784,93 @@ pub async fn disconnect_world() {
 /// Ensure a direct inbox listener is running for this ma-home session.
 /// Returns local inbox endpoint id.
 #[wasm_bindgen]
-pub async fn start_inbox_listener() -> Result<String, JsValue> {
-    ensure_inbox_listener().await
+pub async fn start_inbox_listener(
+    passphrase: &str,
+    encrypted_bundle_json: &str,
+) -> Result<String, JsValue> {
+    let encrypted: EncryptedIdentityBundle = serde_json::from_str(encrypted_bundle_json)
+        .map_err(|e| js_err(format!("invalid bundle JSON: {e}")))?;
+
+    let plain_bytes = decrypt_bundle(passphrase, &encrypted).map_err(js_err)?;
+    let plain: IdentityBundlePlain = serde_json::from_slice(&plain_bytes)
+        .map_err(|e| js_err(format!("bundle corrupted: {e}")))?;
+
+    let key_hex = plain
+        .iroh_secret_key_hex
+        .as_deref()
+        .ok_or_else(|| js_err("bundle missing iroh secret key; run ensure_bundle_iroh_secret first"))?;
+    let iroh_secret_key = restore_iroh_secret_key(key_hex)?;
+
+    ensure_inbox_listener_with_secret(iroh_secret_key).await
+}
+
+/// Ensure the encrypted bundle has a persisted iroh secret key.
+/// Returns JSON: `{ encrypted_bundle, did, ipns, document_json }`
+#[wasm_bindgen]
+pub fn ensure_bundle_iroh_secret(
+    passphrase: &str,
+    encrypted_bundle_json: &str,
+) -> Result<String, JsValue> {
+    let encrypted: EncryptedIdentityBundle = serde_json::from_str(encrypted_bundle_json)
+        .map_err(|e| js_err(format!("invalid bundle JSON: {e}")))?;
+
+    let plain_bytes = decrypt_bundle(passphrase, &encrypted).map_err(js_err)?;
+    let mut plain: IdentityBundlePlain = serde_json::from_slice(&plain_bytes)
+        .map_err(|e| js_err(format!("bundle corrupted: {e}")))?;
+
+    let needs_key = plain
+        .iroh_secret_key_hex
+        .as_deref()
+        .map(|v| v.trim().is_empty())
+        .unwrap_or(true);
+    if needs_key {
+        let generated = SecretKey::from_bytes(&random_bytes::<32>().map_err(js_err)?);
+        plain.iroh_secret_key_hex = Some(hex::encode(generated.to_bytes()));
+    }
+
+    let document_json = plain.document.marshal().map_err(js_err)?;
+    let plain_json = serde_json::to_string(&plain).map_err(js_err)?;
+    let encrypted = encrypt_bundle(passphrase, plain_json.as_bytes()).map_err(js_err)?;
+
+    let result = UpdateResult {
+        encrypted_bundle: serde_json::to_string(&encrypted).map_err(js_err)?,
+        did: plain.document.id.clone(),
+        ipns: plain.ipns,
+        document_json,
+    };
+
+    serde_json::to_string(&result).map_err(js_err)
+}
+
+/// Rotate (replace) the persisted iroh secret key in the encrypted bundle.
+/// Returns JSON: `{ encrypted_bundle, did, ipns, document_json }`
+#[wasm_bindgen]
+pub fn rotate_bundle_iroh_secret(
+    passphrase: &str,
+    encrypted_bundle_json: &str,
+) -> Result<String, JsValue> {
+    let encrypted: EncryptedIdentityBundle = serde_json::from_str(encrypted_bundle_json)
+        .map_err(|e| js_err(format!("invalid bundle JSON: {e}")))?;
+
+    let plain_bytes = decrypt_bundle(passphrase, &encrypted).map_err(js_err)?;
+    let mut plain: IdentityBundlePlain = serde_json::from_slice(&plain_bytes)
+        .map_err(|e| js_err(format!("bundle corrupted: {e}")))?;
+
+    let generated = SecretKey::from_bytes(&random_bytes::<32>().map_err(js_err)?);
+    plain.iroh_secret_key_hex = Some(hex::encode(generated.to_bytes()));
+
+    let document_json = plain.document.marshal().map_err(js_err)?;
+    let plain_json = serde_json::to_string(&plain).map_err(js_err)?;
+    let encrypted = encrypt_bundle(passphrase, plain_json.as_bytes()).map_err(js_err)?;
+
+    let result = UpdateResult {
+        encrypted_bundle: serde_json::to_string(&encrypted).map_err(js_err)?,
+        did: plain.document.id.clone(),
+        ipns: plain.ipns,
+        document_json,
+    };
+
+    serde_json::to_string(&result).map_err(js_err)
 }
 
 /// Poll and drain direct inbox messages received over iroh.
@@ -737,6 +1048,14 @@ fn restore_encryption_key(ipns: &str, private_key_hex: &str) -> Result<Encryptio
     EncryptionKey::from_private_key_bytes(enc_did, private_key).map_err(js_err)
 }
 
+fn restore_iroh_secret_key(private_key_hex: &str) -> Result<SecretKey, JsValue> {
+    let private_key_vec = hex::decode(private_key_hex).map_err(js_err)?;
+    let private_key: [u8; 32] = private_key_vec
+        .try_into()
+        .map_err(|_| js_err("invalid iroh secret key length"))?;
+    Ok(SecretKey::from_bytes(&private_key))
+}
+
 fn parse_signed_message_with_sender_document(sender_document_json: &str, message_cbor_b64: &str) -> Result<Message, JsValue> {
     let sender_document = Document::unmarshal(sender_document_json).map_err(js_err)?;
     let message_cbor = B64.decode(message_cbor_b64).map_err(js_err)?;
@@ -836,6 +1155,7 @@ fn create_identity_internal(passphrase: &str, ipns: &str) -> Result<String, JsVa
 
     let signing_key = SigningKey::generate(sign_did).map_err(js_err)?;
     let encryption_key = EncryptionKey::generate(enc_did).map_err(js_err)?;
+    let iroh_secret_key = SecretKey::from_bytes(&random_bytes::<32>().map_err(js_err)?);
 
     let mut document = Document::new(&root_did, &root_did);
 
@@ -862,6 +1182,7 @@ fn create_identity_internal(passphrase: &str, ipns: &str) -> Result<String, JsVa
     document.add_verification_method(key_agreement_vm.clone()).map_err(js_err)?;
     document.assertion_method = assertion_vm_id;
     document.key_agreement = key_agreement_vm.id.clone();
+    document.set_ma_type("agent");
     document.sign(&signing_key, &assertion_vm).map_err(js_err)?;
 
     let plain = IdentityBundlePlain {
@@ -870,6 +1191,7 @@ fn create_identity_internal(passphrase: &str, ipns: &str) -> Result<String, JsVa
         ipns: ipns.to_string(),
         signing_private_key_hex: hex::encode(signing_key.private_key_bytes()),
         encryption_private_key_hex: hex::encode(encryption_key.private_key_bytes()),
+        iroh_secret_key_hex: Some(hex::encode(iroh_secret_key.to_bytes())),
         document,
     };
 
@@ -954,6 +1276,39 @@ pub fn set_bundle_locale(
     })
 }
 
+/// Update the optional `ma:world` field in the DID document and re-sign it.
+/// Returns JSON: `{ encrypted_bundle, did, ipns, document_json }`
+#[wasm_bindgen]
+pub fn set_bundle_world(
+    passphrase: &str,
+    encrypted_bundle_json: &str,
+    world_did: &str,
+) -> Result<String, JsValue> {
+    update_bundle_document(passphrase, encrypted_bundle_json, |document| {
+        document.set_ma_world(world_did);
+        Ok(())
+    })
+}
+
+/// Update the `ma:transports` field in the DID document with the agent's live
+/// iroh inbox endpoint and re-sign it.
+/// Returns JSON: `{ encrypted_bundle, did, ipns, document_json }`
+#[wasm_bindgen]
+pub fn set_bundle_transports(
+    passphrase: &str,
+    encrypted_bundle_json: &str,
+    endpoint_id: &str,
+) -> Result<String, JsValue> {
+    let hint = format!("/ma-iroh/{}/ma/inbox/1", endpoint_id);
+    let transports = serde_json::json!([hint.clone()]);
+    update_bundle_document(passphrase, encrypted_bundle_json, move |document| {
+        document.set_ma_transports(transports);
+        document.set_ma_current_inbox(&hint);
+        document.set_presence_hint(&hint).map_err(js_err)?;
+        Ok(())
+    })
+}
+
 /// Remove the optional `ma:locale` field from the DID document and re-sign it.
 /// Returns JSON: `{ encrypted_bundle, did, ipns, document_json }`
 #[wasm_bindgen]
@@ -983,15 +1338,15 @@ pub fn clear_bundle_presence_hint(
 /// Enter a world over iroh using the world protocol.
 #[wasm_bindgen]
 pub async fn connect_world(endpoint_id: &str) -> Result<(), JsValue> {
-    let cache = get_or_create_stream_cache(endpoint_id).await?;
-    store_conn_cache(cache);
+    let cache = get_or_create_stream_cache(endpoint_id, WorldTransportKind::World).await?;
+    store_conn_cache(WorldTransportKind::World, cache);
     Ok(())
 }
 
 #[wasm_bindgen]
 pub async fn connect_world_with_relay(endpoint_id: &str, relay_url: &str) -> Result<(), JsValue> {
-    let cache = create_stream_cache(endpoint_id, Some(relay_url)).await?;
-    store_conn_cache(cache);
+    let cache = create_stream_cache(endpoint_id, Some(relay_url), WorldTransportKind::World).await?;
+    store_conn_cache(WorldTransportKind::World, cache);
     Ok(())
 }
 
@@ -1061,7 +1416,7 @@ pub async fn send_world_chat(
     let timestamp_ms = js_sys::Date::now() as u64;
     let message = build_signed_message_with_js_time(
         from_did.id(),
-        WORLD_TARGET_DID.to_string(),
+        String::new(),
         CONTENT_TYPE_CHAT.to_string(),
         text.as_bytes().to_vec(),
         &signing_key,
@@ -1072,7 +1427,7 @@ pub async fn send_world_chat(
         room: room.trim().to_string(),
         message_cbor: message.to_cbor().map_err(js_err)?,
     };
-    let response = send_world_request(endpoint_id, request).await?;
+    let response = send_world_chat_request(endpoint_id, request).await?;
 
     serde_json::to_string(&WorldActionResult {
         ok: response.ok,
@@ -1091,7 +1446,7 @@ pub async fn send_world_chat(
 /// Send an E2E-encrypted `application/x-ma-whisper` to recipient DID.
 #[wasm_bindgen]
 pub async fn send_world_whisper(
-    endpoint_id: &str,
+    _endpoint_id: &str,
     passphrase: &str,
     encrypted_bundle_json: &str,
     actor_name: &str,
@@ -1105,6 +1460,7 @@ pub async fn send_world_whisper(
         .map_err(|e| js_err(format!("bundle corrupted: {e}")))?;
 
     let recipient_document = Document::unmarshal(recipient_document_json).map_err(js_err)?;
+    let recipient_endpoint_id = recipient_inbox_endpoint_id(&recipient_document)?;
     let actor_name = actor_name.trim();
     let from_did = Did::try_from(plain.document.id.as_str())
         .and_then(|did| did.with_fragment(actor_name))
@@ -1124,21 +1480,18 @@ pub async fn send_world_whisper(
         timestamp_ms,
     )?;
 
-    let request = WorldRequest::Whisper {
-        message_cbor: message.to_cbor().map_err(js_err)?,
-    };
-    let response = send_world_request(endpoint_id, request).await?;
+    let response = send_inbox_signed_message(&recipient_endpoint_id, message.to_cbor().map_err(js_err)?).await?;
 
     serde_json::to_string(&WorldActionResult {
         ok: response.ok,
-        room: response.room,
+        room: String::new(),
         message: response.message,
-        endpoint_id: response.endpoint_id,
-        latest_event_sequence: response.latest_event_sequence,
-        broadcasted: response.broadcasted,
-        events: response.events,
-        handle: response.handle,
-        pending_whispers: response.pending_whispers,
+        endpoint_id: recipient_endpoint_id,
+        latest_event_sequence: 0,
+        broadcasted: false,
+        events: Vec::new(),
+        handle: String::new(),
+        pending_whispers: Vec::new(),
     })
     .map_err(js_err)
 }
@@ -1194,17 +1547,69 @@ pub async fn send_world_message(
 ) -> Result<String, JsValue> {
     let timestamp_ms = js_sys::Date::now() as u64;
     let canonical = canonical_locale(locale);
+    let envelope = parse_message_with_locale(text, &canonical);
+    let is_admin_world_command =
+        matches!(&envelope, ma_actor::MessageEnvelope::ActorCommand { target, .. } if target.eq_ignore_ascii_case("world"));
+    if !is_admin_world_command {
+        return Err(js_err("ma/world/1 only accepts @@ world commands; send normal commands over ma/cmd/1"));
+    }
     let request = build_signed_world_request(
         passphrase,
         encrypted_bundle_json,
         actor_name,
         WorldCommand::Message {
             room: room.trim().to_string(),
-            envelope: parse_message_with_locale(text, &canonical),
+            envelope,
         },
         timestamp_ms,
     )?;
     let response = send_world_request(endpoint_id, request).await?;
+
+    serde_json::to_string(&WorldActionResult {
+        ok: response.ok,
+        room: response.room,
+        message: response.message,
+        endpoint_id: response.endpoint_id,
+        latest_event_sequence: response.latest_event_sequence,
+        broadcasted: response.broadcasted,
+        events: response.events,
+        handle: response.handle,
+        pending_whispers: response.pending_whispers,
+    })
+    .map_err(js_err)
+}
+
+/// Send a room/gameplay command over iroh using the command protocol.
+#[wasm_bindgen]
+pub async fn send_world_cmd(
+    endpoint_id: &str,
+    passphrase: &str,
+    encrypted_bundle_json: &str,
+    actor_name: &str,
+    room: &str,
+    locale: &str,
+    text: &str,
+) -> Result<String, JsValue> {
+    let timestamp_ms = js_sys::Date::now() as u64;
+    let canonical = canonical_locale(locale);
+    let envelope = parse_message_with_locale(text, &canonical);
+    let is_admin_world_command =
+        matches!(&envelope, ma_actor::MessageEnvelope::ActorCommand { target, .. } if target.eq_ignore_ascii_case("world"));
+    if is_admin_world_command {
+        return Err(js_err("@@ world commands must use ma/world/1"));
+    }
+
+    let request = build_signed_world_request(
+        passphrase,
+        encrypted_bundle_json,
+        actor_name,
+        WorldCommand::Message {
+            room: room.trim().to_string(),
+            envelope,
+        },
+        timestamp_ms,
+    )?;
+    let response = send_world_cmd_request(endpoint_id, request).await?;
 
     serde_json::to_string(&WorldActionResult {
         ok: response.ok,

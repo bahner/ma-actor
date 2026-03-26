@@ -1,7 +1,9 @@
 import init, {
   create_identity_with_ipns,
   unlock_identity,
+  ensure_bundle_iroh_secret,
   set_bundle_locale,
+  set_bundle_transports,
   generate_bip39_phrase,
   normalize_bip39_phrase,
   connect_world,
@@ -10,6 +12,7 @@ import init, {
   poll_world_events,
   send_world_chat,
   send_world_whisper,
+  send_world_cmd,
   send_world_message,
   decode_chat_event_message,
   decode_whisper_event_message,
@@ -37,6 +40,8 @@ const LAST_ALIAS_KEY = `${STORAGE_PREFIX}.lastAlias`;
 const TAB_ALIAS_KEY = `${STORAGE_PREFIX}.tabAlias`;
 const DEBUG_KEY = `${STORAGE_PREFIX}.debug`;
 const LEGACY_BUNDLE_KEY = 'ma.identity.v2.bundle';
+const LAST_ROOM_KEY_PREFIX = `${STORAGE_PREFIX}.lastRoom`;
+const BLOCKLIST_KEY_PREFIX = `${STORAGE_PREFIX}.blockedDidRoots`;
 const LEGACY_API_KEY = 'ma.identity.v2.kuboApi';
 const LEGACY_ALIAS_KEY = 'ma.identity.v2.alias';
 const DEFAULT_LOCALE = 'en';
@@ -63,12 +68,91 @@ const state = {
   passphrase: '',
   handleDidMap: {},
   didEndpointMap: {},
+  blockedDidRoots: new Set(),
   didDocCache: new Map(),
   inboxEndpointId: '',
   commandHistory: [],
   historyIndex: -1,
   historyDraft: ''
 };
+
+const RECONNECT_DELAY_MS = 3000;
+
+function lastRoomKey(identityDid, endpointId) {
+  const idPart = (identityDid || '').split(':').pop() || 'unknown';
+  const epPart = (endpointId || '').slice(0, 16);
+  return `${LAST_ROOM_KEY_PREFIX}.${idPart}.${epPart}`;
+}
+
+function saveLastRoom(endpointId, room) {
+  if (!state.identity?.did || !endpointId || !room) return;
+  try { localStorage.setItem(lastRoomKey(state.identity.did, endpointId), room); } catch (_) {}
+}
+
+function loadLastRoom(endpointId) {
+  if (!state.identity?.did || !endpointId) return null;
+  try { return localStorage.getItem(lastRoomKey(state.identity.did, endpointId)) || null; } catch (_) { return null; }
+}
+
+function blocklistKey(identityDid) {
+  const rootDid = didRoot(identityDid || '');
+  if (!rootDid) return '';
+  return `${BLOCKLIST_KEY_PREFIX}.${rootDid}`;
+}
+
+function saveBlockedDidRoots() {
+  if (!state.identity?.did) {
+    return;
+  }
+  const key = blocklistKey(state.identity.did);
+  if (!key) {
+    return;
+  }
+  const entries = Array.from(state.blockedDidRoots || []).sort();
+  localStorage.setItem(key, JSON.stringify(entries));
+}
+
+function loadBlockedDidRootsForIdentity(identityDid) {
+  const key = blocklistKey(identityDid);
+  if (!key) {
+    state.blockedDidRoots = new Set();
+    return;
+  }
+  try {
+    const raw = localStorage.getItem(key);
+    if (!raw) {
+      state.blockedDidRoots = new Set();
+      return;
+    }
+    const parsed = JSON.parse(raw);
+    if (!Array.isArray(parsed)) {
+      state.blockedDidRoots = new Set();
+      return;
+    }
+    state.blockedDidRoots = new Set(
+      parsed
+        .map((value) => didRoot(String(value || '')))
+        .filter((value) => value.startsWith('did:ma:'))
+    );
+  } catch {
+    state.blockedDidRoots = new Set();
+  }
+}
+
+function resolveTargetDidRoot(token) {
+  const key = String(token || '').trim();
+  if (!key) {
+    throw new Error('Usage: /block <did|alias|handle>');
+  }
+  const resolved = resolveAliasInput(key);
+  const mappedDid = state.handleDidMap[key] || state.handleDidMap[resolved] || '';
+  const candidate = mappedDid || findDidByEndpoint(resolved) || resolved;
+  const root = didRoot(candidate);
+  if (!root.startsWith('did:ma:')) {
+    throw new Error(`Could not resolve a did:ma target from '${key}'.`);
+  }
+  return root;
+}
 
 function readStoredDebugFlag() {
   const raw = localStorage.getItem(DEBUG_KEY);
@@ -205,11 +289,6 @@ async function pollCurrentHomeEvents() {
       nextSequence = eventSequence;
     }
 
-    // Whisper delivery can arrive outside room event stream.
-    for (const whisper of result.pending_whispers || []) {
-      await dispatchInboundEvent(whisper);
-    }
-
     state.currentHome.lastEventSequence = Math.max(
       nextSequence,
       toSequenceNumber(result.latest_event_sequence || home.lastEventSequence || 0)
@@ -239,8 +318,29 @@ function startHomeEventPolling() {
         console.error('room event poll failed', error);
       }
       if (!state.pollErrorShown) {
-        appendMessage('system', `Room sync failed: ${error instanceof Error ? error.message : String(error)}`);
-        state.pollErrorShown = true;
+        const home = state.currentHome;
+        if (home) {
+          stopHomeEventPolling();
+          logger.log('reconnect', `poll failed, attempting silent re-entry to ${home.endpointId.slice(0, 8)}...`);
+          delay(RECONNECT_DELAY_MS)
+            .then(() => enterWorldWithRetry(home.endpointId, state.aliasName, home.room))
+            .then(raw => {
+              const r = JSON.parse(raw);
+              if (!r.ok) throw new Error(r.message || 're-enter failed');
+              state.currentHome.lastEventSequence = toSequenceNumber(r.latest_event_sequence || 0);
+              state.pollErrorShown = false;
+              logger.log('reconnect', `silent re-entry succeeded, room=${r.room}`);
+              startHomeEventPolling();
+            })
+            .catch(err => {
+              appendMessage('system', `Disconnected: ${err instanceof Error ? err.message : String(err)}`);
+              state.pollErrorShown = true;
+              startHomeEventPolling();
+            });
+        } else {
+          appendMessage('system', `Room sync failed: ${error instanceof Error ? error.message : String(error)}`);
+          state.pollErrorShown = true;
+        }
       }
       });
   }, ROOM_POLL_INTERVAL_MS);
@@ -266,7 +366,6 @@ function showChat() {
   updateIdentityLine();
 
   const aliases = Object.keys(state.aliasBook).length;
-  appendMessage('system', 'Ready to explore.');
   appendMessage('system', `Saved aliases: ${aliases}. Use /help for commands.`);
   if (state.debug) {
     logger.log('app', 'debug mode is on');
@@ -295,7 +394,7 @@ async function runSmokeTest(targetAlias) {
 
   const sendResult = JSON.parse(
     await withTimeout(
-      send_world_message(
+      send_world_cmd(
         state.currentHome.endpointId,
         state.passphrase,
         state.encryptedBundle,
@@ -562,13 +661,15 @@ async function onCreateIdentity() {
 
     const ipns = await ensureKuboAliasKey(aliasName);
     const created = JSON.parse(create_identity_with_ipns(passphrase, ipns));
-    const result = JSON.parse(set_bundle_locale(passphrase, created.encrypted_bundle, locale));
+    const localized = JSON.parse(set_bundle_locale(passphrase, created.encrypted_bundle, locale));
+    const result = JSON.parse(ensure_bundle_iroh_secret(passphrase, localized.encrypted_bundle));
 
     state.identity = result;
     state.encryptedBundle = result.encrypted_bundle;
     state.passphrase = passphrase;
     state.aliasName = aliasName;
     state.locale = locale;
+    loadBlockedDidRootsForIdentity(result.did);
 
     byId('bundle-text').value = result.encrypted_bundle;
 
@@ -578,6 +679,11 @@ async function onCreateIdentity() {
 
     setSetupStatus('Identity created and unlocked.');
     showChat();
+
+    appendMessage('system', 'Publishing DID document on startup...');
+    publishDidDocument().catch((err) => {
+      appendMessage('system', `Startup publish failed: ${err instanceof Error ? err.message : String(err)}`);
+    });
   } catch (error) {
     setSetupStatus(error instanceof Error ? error.message : String(error));
   }
@@ -598,13 +704,15 @@ async function onUnlockIdentity() {
       appendMessage('system', `Warning: bundle ipns (${unlocked.ipns}) does not match alias key ipns (${ipns}).`);
     }
 
-    const updated = JSON.parse(set_bundle_locale(passphrase, bundle, locale));
+    const localized = JSON.parse(set_bundle_locale(passphrase, bundle, locale));
+    const updated = JSON.parse(ensure_bundle_iroh_secret(passphrase, localized.encrypted_bundle));
 
     state.identity = updated;
     state.encryptedBundle = updated.encrypted_bundle;
     state.passphrase = passphrase;
     state.aliasName = aliasName;
     state.locale = locale;
+    loadBlockedDidRootsForIdentity(updated.did);
 
     byId('bundle-text').value = updated.encrypted_bundle;
 
@@ -614,6 +722,11 @@ async function onUnlockIdentity() {
 
     setSetupStatus('Bundle unlocked.');
     showChat();
+
+    appendMessage('system', 'Publishing DID document on startup...');
+    publishDidDocument().catch((err) => {
+      appendMessage('system', `Startup publish failed: ${err instanceof Error ? err.message : String(err)}`);
+    });
   } catch (error) {
     setSetupStatus(error instanceof Error ? error.message : String(error));
   }
@@ -668,12 +781,25 @@ function lockSession() {
   state.passphrase = '';
   state.currentHome = null;
   state.didDocCache.clear();
+  state.blockedDidRoots = new Set();
   byId('transcript').innerHTML = '';
   setSetupStatus('Session locked. Bundle remains stored unless removed manually.');
   showSetup();
 }
 
 async function publishDidDocument() {
+  // Embed the agent's live iroh inbox endpoint into ma:transports.
+  const inboxId = state.inboxEndpointId || await start_inbox_listener(state.passphrase, state.encryptedBundle);
+  if (inboxId) {
+    if (!state.inboxEndpointId) state.inboxEndpointId = inboxId;
+    const withTransports = JSON.parse(
+      set_bundle_transports(state.passphrase, state.encryptedBundle, inboxId)
+    );
+    state.identity = withTransports;
+    state.encryptedBundle = withTransports.encrypted_bundle;
+    byId('bundle-text').value = withTransports.encrypted_bundle;
+  }
+
   const blob = new Blob([state.identity.document_json], { type: 'application/json' });
   const formData = new FormData();
   formData.append('file', blob, 'did-document.json');
@@ -693,14 +819,29 @@ async function publishDidDocument() {
   const ipnsName = pubResult.Name;
   const ipfsValue = pubResult.Value;
   appendMessage('system', `Published: /ipns/${ipnsName} -> ${ipfsValue}`);
+  const resolved = await kuboPost('/api/v0/name/resolve', {
+    arg: `/ipns/${ipnsName}`,
+    recursive: 'true'
+  });
+  const resolvedPath = String(resolved?.Path || '').trim() || '(no path)';
+  appendMessage('system', `Resolved now: /ipns/${ipnsName} -> ${resolvedPath}`);
   appendMessage('system', `DID document at: https://ipfs.io/ipns/${ipnsName}`);
 }
 
 function normalizeIrohAddress(address) {
   const value = String(address || '').trim();
   if (!value) return '';
+  if (value.startsWith('/ma-iroh/')) {
+    // Strip /ma-iroh/ prefix and any ALPN suffix after the node id
+    return value.slice('/ma-iroh/'.length).split('/')[0];
+  }
+  if (value.startsWith('/iroh+ma/')) {
+    // Strip /iroh+ma/ prefix and any ALPN suffix after the node id
+    return value.slice('/iroh+ma/'.length).split('/')[0];
+  }
   if (value.startsWith('/iroh/')) {
-    return value.slice('/iroh/'.length);
+    // Strip /iroh/ prefix and any ALPN suffix after the node id
+    return value.slice('/iroh/'.length).split('/')[0];
   }
   return value;
 }
@@ -814,6 +955,108 @@ async function fetchDidDocumentJsonByDid(did) {
   return documentJson;
 }
 
+function parseDidDocument(jsonText) {
+  try {
+    return JSON.parse(jsonText);
+  } catch {
+    return null;
+  }
+}
+
+function extractEndpointFromTransportEntry(entry) {
+  if (!entry) return '';
+  if (typeof entry === 'string') {
+    const endpoint = normalizeIrohAddress(entry);
+    return isLikelyIrohAddress(endpoint) ? endpoint : '';
+  }
+  if (typeof entry !== 'object') {
+    return '';
+  }
+
+  const candidates = [
+    entry.endpoint_id,
+    entry.endpointId,
+    entry.iroh,
+    entry.address,
+    entry.presence_hint,
+    entry.presenceHint
+  ];
+  for (const candidate of candidates) {
+    const endpoint = normalizeIrohAddress(candidate || '');
+    if (isLikelyIrohAddress(endpoint)) {
+      return endpoint;
+    }
+  }
+
+  return '';
+}
+
+function extractWorldEndpointFromDidDoc(document) {
+  if (!document || typeof document !== 'object') {
+    return '';
+  }
+
+  const ma = document.ma && typeof document.ma === 'object' ? document.ma : null;
+
+  const transports = ma?.transports;
+  if (Array.isArray(transports)) {
+    for (const entry of transports) {
+      const endpoint = extractEndpointFromTransportEntry(entry);
+      if (endpoint) {
+        return endpoint;
+      }
+    }
+  }
+
+  const fallback = normalizeIrohAddress(ma?.presenceHint || '');
+  if (isLikelyIrohAddress(fallback)) {
+    return fallback;
+  }
+
+  return '';
+}
+
+function parseEnterDirective(message) {
+  const text = String(message || '');
+  const match = text.match(/(?:^|\s)\/enter\s+(did:ma:[^\s]+)/i);
+  if (!match) {
+    return null;
+  }
+  const rawDid = String(match[1] || '').replace(/[),.;]+$/, '');
+  if (!rawDid.startsWith('did:ma:')) {
+    return null;
+  }
+  return rawDid;
+}
+
+async function autoFollowEnterDirective(message) {
+  const targetDid = parseEnterDirective(message);
+  if (!targetDid) {
+    return;
+  }
+
+  const targetRoot = didRoot(targetDid);
+  const roomFragment = targetDid.includes('#') ? targetDid.split('#')[1] : '';
+
+  // Resolve target DID first; if it points at a world via ma:world, use that world doc.
+  const targetDocJson = await fetchDidDocumentJsonByDid(targetRoot);
+  const targetDoc = parseDidDocument(targetDocJson);
+  const hintedWorldDid = typeof targetDoc?.ma?.world === 'string'
+    ? targetDoc.ma.world
+    : '';
+  const worldDid = hintedWorldDid ? didRoot(hintedWorldDid) : targetRoot;
+
+  const worldDocJson = await fetchDidDocumentJsonByDid(worldDid);
+  const worldDoc = parseDidDocument(worldDocJson);
+  const endpointId = extractWorldEndpointFromDidDoc(worldDoc);
+  if (!endpointId) {
+    throw new Error(`No iroh endpoint found in world DID document for ${worldDid}`);
+  }
+
+  appendMessage('system', `Following traveler route to ${targetDid}...`);
+  await enterHome(endpointId, roomFragment || 'lobby');
+}
+
 function displayActor(senderDid, senderHandle) {
   const fullDid = String(senderDid || '').trim();
   const root = didRoot(fullDid);
@@ -833,6 +1076,39 @@ function renderLocalBroadcastMessage(text) {
   const senderDid = currentActorDid();
   const actor = displayActor(senderDid, state.aliasName);
   appendMessage('world', humanizeText(`${actor}: ${text}`));
+}
+
+function updateRoomHeading(desc) {
+  const el = byId('room-heading');
+  if (!el) return;
+  el.textContent = (desc && desc.trim()) ? desc : (state.currentHome?.room || 'Welcome');
+}
+
+function applyWorldResponse(result) {
+  if (!state.currentHome) {
+    return;
+  }
+
+  if (result.room) {
+    state.currentHome.room = result.room;
+    saveLastRoom(state.currentHome.endpointId, result.room);
+    updateIdentityLine();
+  }
+
+  if (result.room_description !== undefined) {
+    updateRoomHeading(result.room_description);
+  }
+
+  state.currentHome.lastEventSequence = toSequenceNumber(
+    result.latest_event_sequence || state.currentHome.lastEventSequence || 0
+  );
+
+  if (!result.broadcasted) {
+    appendMessage('world', result.message || '(no response)');
+    autoFollowEnterDirective(result.message).catch((err) => {
+      appendMessage('system', `Auto-enter failed: ${err instanceof Error ? err.message : String(err)}`);
+    });
+  }
 }
 
 function isLikelyIrohAddress(address) {
@@ -981,21 +1257,37 @@ async function enterWorldWithRetry(endpointId, actorName, room) {
   throw lastError || new Error('iroh connect failed');
 }
 
-async function enterHome(target) {
+async function enterHome(target, preferredRoom = null) {
   if (!state.identity) {
     throw new Error('Load or create an identity before entering a home.');
   }
 
   const alias = String(target || '').trim();
   if (!alias) {
-    throw new Error('Usage: /enter </iroh/...|alias>');
+    throw new Error('Usage: /enter </ma-iroh/...|/iroh/...|alias>');
   }
 
   const resolvedInput = resolveAliasInput(alias);
+  const resolvedDidRoot = String(resolvedInput).startsWith('did:ma:') ? didRoot(resolvedInput) : '';
+  const resolvedDidFragment = String(resolvedInput).includes('#') ? String(resolvedInput).split('#')[1] : '';
   let endpointId = normalizeIrohAddress(resolvedInput);
   if (String(resolvedInput).startsWith('did:ma:')) {
     endpointId = state.didEndpointMap[didRoot(resolvedInput)] || endpointId;
   }
+
+  if (!endpointId && resolvedDidRoot) {
+    const targetDocJson = await fetchDidDocumentJsonByDid(resolvedDidRoot);
+    const targetDoc = parseDidDocument(targetDocJson);
+    const hintedWorldDid = typeof targetDoc?.ma?.world === 'string'
+      ? targetDoc.ma.world
+      : '';
+    const worldDid = hintedWorldDid ? didRoot(hintedWorldDid) : resolvedDidRoot;
+    const worldDocJson = await fetchDidDocumentJsonByDid(worldDid);
+    const worldDoc = parseDidDocument(worldDocJson);
+    endpointId = extractWorldEndpointFromDidDoc(worldDoc);
+  }
+
+  const effectivePreferredRoom = String(preferredRoom || '').trim() || resolvedDidFragment;
   logger.log('enter.home', `alias=${alias} resolved=${resolvedInput} endpoint=${endpointId.slice(0, 8)}...`);
   
   if (!isLikelyIrohAddress(endpointId)) {
@@ -1005,9 +1297,22 @@ async function enterHome(target) {
   }
 
   appendMessage('system', `Connecting to ${humanizeIdentifier(endpointId)}...`);
-  const result = JSON.parse(
-    await enterWorldWithRetry(endpointId, state.aliasName, 'lobby')
-  );
+  const requestedRoom = effectivePreferredRoom;
+  const savedRoom = requestedRoom || loadLastRoom(endpointId);
+  let result;
+  if (savedRoom && savedRoom !== 'lobby') {
+    try {
+      result = JSON.parse(await enterWorldWithRetry(endpointId, state.aliasName, savedRoom));
+      if (!result.ok) {
+        logger.log('enter.home', `last room '${savedRoom}' denied (${result.message}), falling back to lobby`);
+        result = JSON.parse(await enterWorldWithRetry(endpointId, state.aliasName, 'lobby'));
+      }
+    } catch (_) {
+      result = JSON.parse(await enterWorldWithRetry(endpointId, state.aliasName, 'lobby'));
+    }
+  } else {
+    result = JSON.parse(await enterWorldWithRetry(endpointId, state.aliasName, 'lobby'));
+  }
   logger.log('enter.home', `result ok=${result.ok} room=${result.room} endpoint=${result.endpoint_id?.slice(0, 8)}... latest_seq=${result.latest_event_sequence || 0}`);
 
   if (!result.ok) {
@@ -1023,14 +1328,12 @@ async function enterHome(target) {
     lastEventSequence: toSequenceNumber(result.latest_event_sequence || 0),
     handle: result.handle || state.aliasName
   };
+  saveLastRoom(endpointId, activeRoom);
   updateIdentityLine();
+  updateRoomHeading(result.room_description || activeRoom);
 
   await ensureInboxListener();
   updateIdentityLine();
-
-  for (const whisper of result.pending_whispers || []) {
-    await dispatchInboundEvent(whisper);
-  }
 
   startHomeEventPolling();
   await pollCurrentHomeEvents();
@@ -1051,6 +1354,33 @@ async function sendCurrentWorldMessage(text) {
   }
 
   const trimmedText = text.trim();
+
+  if (trimmedText.startsWith("'")) {
+    const payload = trimmedText.substring(1);
+    const sendStart = Date.now();
+    logger.log('send.chat', `room=${state.currentHome.room} actor=${state.aliasName} msg_len=${payload.length}`);
+
+    const result = JSON.parse(
+      await send_world_chat(
+        state.currentHome.endpointId,
+        state.passphrase,
+        state.encryptedBundle,
+        state.aliasName,
+        state.currentHome.room,
+        payload
+      )
+    );
+    const elapsed = Date.now() - sendStart;
+    logger.log('send.chat', `response ok=${result.ok} broadcasted=${result.broadcasted} latest_seq=${result.latest_event_sequence || 0} in ${elapsed}ms`);
+
+    if (!result.ok) {
+      throw new Error(result.message || 'chat failed');
+    }
+
+    renderLocalBroadcastMessage(payload);
+    await pollCurrentHomeEvents();
+    return;
+  }
 
   if (trimmedText.startsWith('@@')) {
     const sendStart = Date.now();
@@ -1075,10 +1405,7 @@ async function sendCurrentWorldMessage(text) {
     }
 
     if (!result.broadcasted) {
-      state.currentHome.lastEventSequence = toSequenceNumber(
-        result.latest_event_sequence || state.currentHome.lastEventSequence || 0
-      );
-      appendMessage('world', result.message || '(no response)');
+      applyWorldResponse(result);
       return;
     }
 
@@ -1123,7 +1450,7 @@ async function sendCurrentWorldMessage(text) {
     const sendStart = Date.now();
     logger.log('send.command', `room=${state.currentHome.room} actor=${state.aliasName} msg_len=${trimmed.length}`);
     const result = JSON.parse(
-      await send_world_message(
+      await send_world_cmd(
         state.currentHome.endpointId,
         state.passphrase,
         state.encryptedBundle,
@@ -1141,10 +1468,7 @@ async function sendCurrentWorldMessage(text) {
     }
 
     if (!result.broadcasted) {
-      state.currentHome.lastEventSequence = toSequenceNumber(
-        result.latest_event_sequence || state.currentHome.lastEventSequence || 0
-      );
-      appendMessage('world', result.message || '(no response)');
+      applyWorldResponse(result);
       return;
     }
 
@@ -1156,7 +1480,7 @@ async function sendCurrentWorldMessage(text) {
   logger.log('send.command', `room=${state.currentHome.room} actor=${state.aliasName} msg_len=${trimmedText.length}`);
 
   const result = JSON.parse(
-    await send_world_message(
+    await send_world_cmd(
       state.currentHome.endpointId,
       state.passphrase,
       state.encryptedBundle,
@@ -1174,10 +1498,7 @@ async function sendCurrentWorldMessage(text) {
   }
   
   if (!result.broadcasted) {
-    state.currentHome.lastEventSequence = toSequenceNumber(
-      result.latest_event_sequence || state.currentHome.lastEventSequence || 0
-    );
-    appendMessage('world', result.message || '(no response)');
+    applyWorldResponse(result);
     return;
   }
 
@@ -1237,10 +1558,13 @@ function parseSlash(input) {
     appendMessage('system', '  alias <name> <address>     - same as /alias');
     appendMessage('system', '  /unalias <name>            - remove a saved alias');
     appendMessage('system', '  /aliases                   - list saved aliases');
-    appendMessage('system', '  /enter </iroh/...|alias>   - enter a home by endpoint id or alias');
+    appendMessage('system', '  /enter </ma-iroh/...|/iroh/...|alias> - enter a home by endpoint id or alias');
     appendMessage('system', '  /smoke [alias]             - run enter + send + poll smoke test');
     appendMessage('system', '  /locale <en|nb-NO>         - change actor language for this alias');
     appendMessage('system', '  /publish                   - publish DID document to IPNS');
+    appendMessage('system', '  /block <did|alias|handle>  - block inbound messages from sender DID root');
+    appendMessage('system', '  /unblock <did|alias|handle>- remove sender from block list');
+    appendMessage('system', '  /blocks                    - list blocked sender DID roots');
     appendMessage('system', '  /debug [on|off]            - toggle debug logs in transcript');
     appendMessage('system', 'Messaging:');
     appendMessage('system', '  command                    - command to your avatar (e.g. go north, who)');
@@ -1369,9 +1693,65 @@ function parseSlash(input) {
     return true;
   }
 
+  if (cmd === '/blocks') {
+    const blocked = Array.from(state.blockedDidRoots || []).sort();
+    if (!blocked.length) {
+      appendMessage('system', 'No blocked senders.');
+      return true;
+    }
+    appendMessage('system', `Blocked senders (${blocked.length}):`);
+    for (const did of blocked) {
+      appendMessage('system', `  ${did}`);
+    }
+    return true;
+  }
+
+  if (cmd === '/block') {
+    if (rest.length !== 1) {
+      appendMessage('system', 'Usage: /block <did|alias|handle>');
+      return true;
+    }
+    try {
+      const root = resolveTargetDidRoot(rest[0]);
+      if (state.identity && didRoot(state.identity.did) === root) {
+        appendMessage('system', 'Refusing to block your own DID root.');
+        return true;
+      }
+      const before = state.blockedDidRoots.size;
+      state.blockedDidRoots.add(root);
+      if (state.blockedDidRoots.size !== before) {
+        saveBlockedDidRoots();
+      }
+      appendMessage('system', `Blocked sender: ${root}`);
+    } catch (error) {
+      appendMessage('system', error instanceof Error ? error.message : String(error));
+    }
+    return true;
+  }
+
+  if (cmd === '/unblock') {
+    if (rest.length !== 1) {
+      appendMessage('system', 'Usage: /unblock <did|alias|handle>');
+      return true;
+    }
+    try {
+      const root = resolveTargetDidRoot(rest[0]);
+      const removed = state.blockedDidRoots.delete(root);
+      if (removed) {
+        saveBlockedDidRoots();
+        appendMessage('system', `Unblocked sender: ${root}`);
+      } else {
+        appendMessage('system', `Sender not blocked: ${root}`);
+      }
+    } catch (error) {
+      appendMessage('system', error instanceof Error ? error.message : String(error));
+    }
+    return true;
+  }
+
   if (cmd === '/enter') {
     if (rest.length !== 1) {
-      appendMessage('system', 'Usage: /enter </iroh/...|alias>');
+      appendMessage('system', 'Usage: /enter </ma-iroh/...|/iroh/...|alias>');
       return true;
     }
     enterHome(rest[0]).catch((err) => {

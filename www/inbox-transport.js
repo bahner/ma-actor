@@ -12,7 +12,7 @@ export function createInboxTransport({
     if (state.inboxEndpointId) {
       return state.inboxEndpointId;
     }
-    const endpointId = await startInboxListener();
+    const endpointId = await startInboxListener(state.passphrase, state.encryptedBundle);
     state.inboxEndpointId = endpointId;
     logger.log('inbox.listener', `listening on ${endpointId}`);
     return endpointId;

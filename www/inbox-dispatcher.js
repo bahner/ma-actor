@@ -55,6 +55,24 @@ export function createInboundDispatcher(deps) {
     );
   }
 
+  function isBlockedSender(evt) {
+    const senderRootDid = didRoot(evt.senderDid || '');
+    if (!senderRootDid) {
+      return false;
+    }
+    const blocked = state.blockedDidRoots;
+    if (!blocked) {
+      return false;
+    }
+    if (blocked instanceof Set) {
+      return blocked.has(senderRootDid);
+    }
+    if (Array.isArray(blocked)) {
+      return blocked.includes(senderRootDid);
+    }
+    return false;
+  }
+
   function writeDialogChat(senderDid, senderHandle, text) {
     const actor = displayActor(senderDid, senderHandle);
     appendMessage('world', humanizeText(`${actor}: ${text}`));
@@ -136,10 +154,12 @@ export function createInboundDispatcher(deps) {
   async function dispatchInboundEvent(event) {
     const evt = normalizeInboundEvent(event);
     if (!evt) {
+      logger.log('inbox.dispatch', 'dropped malformed inbound event');
       return;
     }
 
     if (!evt.text && !evt.messageCborB64) {
+      logger.log('inbox.dispatch', `dropped empty inbound event kind=${evt.kind}`);
       return;
     }
 
@@ -150,7 +170,13 @@ export function createInboundDispatcher(deps) {
       state.didEndpointMap[didRoot(evt.senderDid)] = evt.senderEndpoint;
     }
 
+    if (isBlockedSender(evt)) {
+      logger.log('inbox.dispatch', `dropped blocked sender ${didRoot(evt.senderDid || '')}`);
+      return;
+    }
+
     if (shouldSuppressInboundEcho(evt)) {
+      logger.log('inbox.dispatch', `dropped self-echo sender=${didRoot(evt.senderDid || '')}`);
       return;
     }
 

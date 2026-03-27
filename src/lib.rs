@@ -8,7 +8,7 @@ use chacha20poly1305::{
     Key, XChaCha20Poly1305, XNonce,
 };
 use did_ma::{
-    CONTENT_TYPE_CHAT, CONTENT_TYPE_COMMAND, CONTENT_TYPE_WHISPER,
+    CONTENT_TYPE_CHAT, CONTENT_TYPE_CMD, CONTENT_TYPE_WORLD, CONTENT_TYPE_WHISPER,
     Did, Document, EncryptionKey, Message, SigningKey, VerificationMethod,
 };
 use iroh::{
@@ -168,6 +168,55 @@ async fn send_inbox_signed_message(target_endpoint_id: &str, message_cbor: Vec<u
     serde_json::from_slice::<InboxResponse>(&bytes).map_err(js_err)
 }
 
+async fn send_whisper_signed_message(target_endpoint_id: &str, message_cbor: Vec<u8>) -> Result<InboxResponse, JsValue> {
+    let target: EndpointId = target_endpoint_id
+        .trim()
+        .parse()
+        .map_err(|e| js_err(format!("invalid recipient endpoint id: {e}")))?;
+
+    let endpoint = Endpoint::builder(presets::N0)
+        .bind()
+        .await
+        .map_err(|e| js_err(format!("sender endpoint bind failed: {e}")))?;
+    let _ = endpoint.online().await;
+
+    let relay_source = normalize_relay_url(DEFAULT_WORLD_RELAY_URL);
+    let relay_url: RelayUrl = relay_source
+        .parse()
+        .map_err(|e| js_err(format!("relay URL parse failed for '{}': {}", relay_source, e)))?;
+
+    let endpoint_addr = EndpointAddr::new(target).with_relay_url(relay_url);
+    let connection = endpoint
+        .connect(endpoint_addr, WHISPER_ALPN)
+        .await
+        .map_err(|e| js_err(format!("whisper endpoint.connect() failed: {}", e)))?;
+
+    let (mut send, mut recv) = connection
+        .open_bi()
+        .await
+        .map_err(|e| js_err(format!("whisper connection.open_bi() failed: {}", e)))?;
+
+    let request = InboxRequest::Signed { message_cbor };
+    let payload = serde_json::to_vec(&request).map_err(js_err)?;
+
+    send.write_u32(payload.len() as u32).await.map_err(js_err)?;
+    send.write_all(&payload).await.map_err(js_err)?;
+    send.flush().await.map_err(js_err)?;
+
+    let frame_len = recv.read_u32().await.map_err(js_err)? as usize;
+    if frame_len > 256 * 1024 {
+        return Err(js_err(format!("whisper response frame too large: {}", frame_len)));
+    }
+    let mut bytes = vec![0u8; frame_len];
+    recv.read_exact(&mut bytes).await.map_err(js_err)?;
+
+    let _ = send.finish();
+    connection.close(0u32.into(), b"ok");
+    endpoint.close().await;
+
+    serde_json::from_slice::<InboxResponse>(&bytes).map_err(js_err)
+}
+
 struct WorldConnCache {
     endpoint: Endpoint,
     connection: Connection,
@@ -311,7 +360,9 @@ async fn ensure_inbox_listener_with_secret(secret_key: SecretKey) -> Result<Stri
     };
 
     let router = Router::builder(endpoint.clone())
-        .accept(INBOX_ALPN, protocol)
+        .accept(INBOX_ALPN, protocol.clone())
+        .accept(WHISPER_ALPN, protocol.clone())
+        .accept(BROADCAST_ALPN, protocol)
         .spawn();
 
     let endpoint_id = endpoint.id().to_string();
@@ -558,6 +609,8 @@ const WORLD_ALPN: &[u8] = b"ma/world/1";
 const CMD_ALPN: &[u8] = b"ma/cmd/1";
 const CHAT_ALPN: &[u8] = b"ma/chat/1";
 const INBOX_ALPN: &[u8] = b"ma/inbox/1";
+const WHISPER_ALPN: &[u8] = b"ma/whisper/1";
+const BROADCAST_ALPN: &[u8] = b"ma/broadcast/1";
 const WORLD_TARGET_DID: &str = "did:ma:world";
 const MAX_INBOX_EVENTS: usize = 256;
 
@@ -968,6 +1021,7 @@ fn build_signed_world_request(
     encrypted_bundle_json: &str,
     actor_name: &str,
     command: WorldCommand,
+    content_type: &str,
     timestamp_ms: u64,
 ) -> Result<WorldRequest, JsValue> {
     let encrypted: EncryptedIdentityBundle = serde_json::from_str(encrypted_bundle_json)
@@ -992,7 +1046,7 @@ fn build_signed_world_request(
     let message = build_signed_message_with_js_time(
         from_did.id().to_string(),
         WORLD_TARGET_DID.to_string(),
-        CONTENT_TYPE_COMMAND.to_string(),
+        content_type.to_string(),
         content,
         &signing_key,
         timestamp_ms,
@@ -1299,12 +1353,14 @@ pub fn set_bundle_transports(
     encrypted_bundle_json: &str,
     endpoint_id: &str,
 ) -> Result<String, JsValue> {
-    let hint = format!("/ma-iroh/{}/ma/inbox/1", endpoint_id);
-    let transports = serde_json::json!([hint.clone()]);
+    let inbox_hint = format!("/ma-iroh/{}/ma/inbox/1", endpoint_id);
+    let whisper_hint = format!("/ma-iroh/{}/ma/whisper/1", endpoint_id);
+    let broadcast_hint = format!("/ma-iroh/{}/ma/broadcast/1", endpoint_id);
+    let transports = serde_json::json!([inbox_hint.clone(), whisper_hint, broadcast_hint]);
     update_bundle_document(passphrase, encrypted_bundle_json, move |document| {
         document.set_ma_transports(transports);
-        document.set_ma_current_inbox(&hint);
-        document.set_presence_hint(&hint).map_err(js_err)?;
+        document.set_ma_current_inbox(&inbox_hint);
+        document.set_presence_hint(&inbox_hint).map_err(js_err)?;
         Ok(())
     })
 }
@@ -1373,6 +1429,7 @@ pub async fn enter_world(
             },
             preferred_handle: Some(actor_name.trim().to_string()),
         },
+        CONTENT_TYPE_WORLD,
         timestamp_ms,
     )?;
     let response = send_world_request(endpoint_id, request).await?;
@@ -1480,7 +1537,7 @@ pub async fn send_world_whisper(
         timestamp_ms,
     )?;
 
-    let response = send_inbox_signed_message(&recipient_endpoint_id, message.to_cbor().map_err(js_err)?).await?;
+    let response = send_whisper_signed_message(&recipient_endpoint_id, message.to_cbor().map_err(js_err)?).await?;
 
     serde_json::to_string(&WorldActionResult {
         ok: response.ok,
@@ -1561,6 +1618,7 @@ pub async fn send_world_message(
             room: room.trim().to_string(),
             envelope,
         },
+        CONTENT_TYPE_WORLD,
         timestamp_ms,
     )?;
     let response = send_world_request(endpoint_id, request).await?;
@@ -1607,6 +1665,7 @@ pub async fn send_world_cmd(
             room: room.trim().to_string(),
             envelope,
         },
+        CONTENT_TYPE_CMD,
         timestamp_ms,
     )?;
     let response = send_world_cmd_request(endpoint_id, request).await?;
@@ -1644,6 +1703,7 @@ pub async fn poll_world_events(
             room: room.trim().to_string(),
             since_sequence,
         },
+        CONTENT_TYPE_WORLD,
         timestamp_ms,
     )?;
     let response = send_world_request(endpoint_id, request).await?;

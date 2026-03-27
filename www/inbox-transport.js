@@ -39,13 +39,19 @@ export function createInboxTransport({
           continue;
         }
 
+        const kind = routeKey === 'application/x-ma-whisper'
+          ? 'whisper'
+          : routeKey === 'application/x-ma-presence'
+            ? 'presence'
+            : 'chat';
+
         await dispatchInboundEvent({
-          kind: routeKey === 'application/x-ma-whisper' ? 'whisper' : 'chat',
+          kind,
           mime_type: routeKey,
           sender: '',
           sender_did: meta.from,
           sender_endpoint: item.from_endpoint || '',
-          message: '',
+          message: kind === 'presence' ? (meta.content_text || '') : '',
           message_cbor_b64: item.message_cbor_b64,
           sequence: 0,
           occurred_at: ''

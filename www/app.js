@@ -34,6 +34,8 @@ import { createIdentityStore } from './identity-store.js';
 import { createInboxTransport } from './inbox-transport.js';
 
 const STORAGE_PREFIX = 'ma.identity.v3';
+const PROPER_NAME = '間';
+const BRAND_SUBTITLE_STATIC = 'A text-first world for literate play';
 const API_KEY = `${STORAGE_PREFIX}.kuboApi`;
 const ALIAS_BOOK_KEY = `${STORAGE_PREFIX}.aliasBook`;
 const LAST_ALIAS_KEY = `${STORAGE_PREFIX}.lastAlias`;
@@ -73,7 +75,8 @@ const state = {
   inboxEndpointId: '',
   commandHistory: [],
   historyIndex: -1,
-  historyDraft: ''
+  historyDraft: '',
+  roomPresence: new Map()
 };
 
 const RECONNECT_DELAY_MS = 3000;
@@ -173,6 +176,132 @@ function byId(id) {
   return document.getElementById(id);
 }
 
+function applyProperName() {
+  updateDocumentTitle();
+  const brand = byId('brand-proper-name');
+  if (brand) {
+    brand.textContent = PROPER_NAME;
+  }
+  const subtitle = byId('brand-subtitle');
+  if (subtitle) {
+    subtitle.textContent = BRAND_SUBTITLE_STATIC;
+  }
+}
+
+function currentWorldName() {
+  const alias = String(state.currentHome?.alias || '').trim();
+  if (alias) return alias;
+  const endpoint = String(state.currentHome?.endpointId || '').trim();
+  if (endpoint) return endpoint.slice(0, 10);
+  return '';
+}
+
+function updateDocumentTitle() {
+  const world = currentWorldName();
+  document.title = world ? `${PROPER_NAME} - ${world}` : PROPER_NAME;
+}
+
+function humanRoomTitle(rawName) {
+  const name = String(rawName || '').trim();
+  if (!name) return 'Welcome';
+  return name
+    .split(/[-_\s]+/)
+    .filter(Boolean)
+    .map(part => part.charAt(0).toUpperCase() + part.slice(1))
+    .join(' ');
+}
+
+function trackRoomPresence(handle, did) {
+  if (!handle) return;
+  state.roomPresence.set(handle, { handle, did: did || '' });
+  renderAvatarPanel();
+}
+
+function removeRoomPresence(handle) {
+  if (!handle) return;
+  state.roomPresence.delete(handle);
+  renderAvatarPanel();
+}
+
+function clearRoomPresence() {
+  state.roomPresence.clear();
+  renderAvatarPanel();
+}
+
+function renderAvatarPanel() {
+  const list = byId('avatar-list');
+  if (!list) return;
+  list.innerHTML = '';
+  const sorted = Array.from(state.roomPresence.values()).sort((a, b) =>
+    a.handle.localeCompare(b.handle)
+  );
+  for (const entry of sorted) {
+    const li = document.createElement('li');
+    li.className = 'avatar-item';
+    li.textContent = entry.handle;
+    if (entry.did) li.title = entry.did;
+    list.appendChild(li);
+  }
+}
+
+function applyPresencePayload(payload) {
+  if (!payload || typeof payload !== 'object') {
+    return;
+  }
+
+  if (!state.currentHome) {
+    return;
+  }
+
+  const roomName = String(payload.room || '').trim();
+  if (roomName && roomName !== state.currentHome.room) {
+    return;
+  }
+
+  if (typeof payload.room_title === 'string' && payload.room_title) {
+    state.currentHome.roomTitle = payload.room_title;
+  }
+  if (typeof payload.room_description === 'string') {
+    state.currentHome.roomDescription = payload.room_description;
+    updateRoomHeading(state.currentHome.roomTitle || '', payload.room_description);
+  }
+
+  const kind = String(payload.kind || '').trim();
+  if (kind === 'presence.snapshot') {
+    clearRoomPresence();
+    if (Array.isArray(payload.avatars)) {
+      for (const avatar of payload.avatars) {
+        const handle = String(avatar?.handle || '').trim();
+        const did = String(avatar?.did || '').trim();
+        if (handle) {
+          trackRoomPresence(handle, did);
+        }
+      }
+    }
+    return;
+  }
+
+  if (kind === 'presence.join') {
+    const handle = String(payload.actor_handle || '').trim();
+    const did = String(payload.actor_did || '').trim();
+    if (handle) {
+      trackRoomPresence(handle, did);
+    }
+    return;
+  }
+
+  if (kind === 'presence.leave') {
+    const handle = String(payload.actor_handle || '').trim();
+    if (handle) {
+      removeRoomPresence(handle);
+    }
+  }
+}
+
+function updateLocationContext() {
+  updateDocumentTitle();
+}
+
 function setKuboStatus(message, kind = 'idle') {
   const el = byId('kubo-status');
   el.textContent = message;
@@ -225,6 +354,7 @@ const inboundDispatcher = createInboundDispatcher({
   fetchDidDocumentJsonByDid,
   decodeChatEventMessage: decode_chat_event_message,
   decodeWhisperEventMessage: decode_whisper_event_message,
+  onPresenceEvent: applyPresencePayload,
   didRoot
 });
 
@@ -276,6 +406,25 @@ async function pollCurrentHomeEvents() {
       return;
     }
 
+    // Poll responses carry a full room roster so clients converge even if a push is missed.
+    if (Array.isArray(result.avatars)) {
+      clearRoomPresence();
+      for (const avatar of result.avatars) {
+        const handle = String(avatar?.handle || '').trim();
+        if (handle) trackRoomPresence(handle, String(avatar?.did || ''));
+      }
+    }
+    if (typeof result.room_did === 'string' && result.room_did) {
+      state.currentHome.roomDid = result.room_did;
+    }
+    if (typeof result.room_title === 'string' && result.room_title) {
+      state.currentHome.roomTitle = result.room_title;
+    }
+    if (typeof result.room_description === 'string') {
+      state.currentHome.roomDescription = result.room_description;
+      updateRoomHeading(state.currentHome.roomTitle || '', result.room_description);
+    }
+
     let nextSequence = toSequenceNumber(home.lastEventSequence || 0);
     for (const event of result.events || []) {
       const eventSequence = toSequenceNumber(event.sequence);
@@ -285,6 +434,19 @@ async function pollCurrentHomeEvents() {
       }
       const preview = String(event.message || event.message_cbor_b64 || '').slice(0, 40);
       logger.log('poll.events', `dispatching event seq=${eventSequence} kind=${event.kind} sender=${event.sender || '(system)'}: ${preview}`);
+
+      // Track presence from event metadata.
+      if (event.sender) {
+        trackRoomPresence(event.sender, event.sender_did || '');
+      }
+      // Detect leave events: system message of the form "<handle> left <room>".
+      if (event.kind === 'system') {
+        const leaveMatch = String(event.message || '').match(/^(\S+) left /);
+        if (leaveMatch) {
+          removeRoomPresence(leaveMatch[1]);
+        }
+      }
+
       await dispatchInboundEvent(event);
       nextSequence = eventSequence;
     }
@@ -347,22 +509,15 @@ function startHomeEventPolling() {
 }
 
 function updateIdentityLine() {
-  if (!state.identity) {
-    byId('identity-line').textContent = '';
-    return;
-  }
-  const didLabel = humanizeIdentifier(state.identity.did);
-  const locale = state.locale ? ` | locale ${state.locale}` : '';
-  const home = state.currentHome
-    ? ` | world ${humanizeIdentifier(state.currentHome.endpointId)} (${state.currentHome.room})`
-    : '';
-  const inbox = state.inboxEndpointId ? ` | inbox ${humanizeIdentifier(`/iroh/${state.inboxEndpointId}`)}` : '';
-  byId('identity-line').textContent = `did ${didLabel} | ipns ${state.identity.ipns} | alias ${state.aliasName}${locale}${home}${inbox}`;
+  updateLocationContext();
 }
 
 function showChat() {
   byId('setup-view').classList.add('hidden');
   byId('chat-view').classList.remove('hidden');
+  byId('session-tools').classList.remove('hidden');
+  const brandRow = document.querySelector('.brand-row');
+  if (brandRow) brandRow.classList.add('hidden');
   updateIdentityLine();
 
   const aliases = Object.keys(state.aliasBook).length;
@@ -424,8 +579,12 @@ async function runSmokeTest(targetAlias) {
 
 function showSetup() {
   stopHomeEventPolling();
+  byId('session-tools').classList.add('hidden');
   byId('chat-view').classList.add('hidden');
   byId('setup-view').classList.remove('hidden');
+  const brandRow = document.querySelector('.brand-row');
+  if (brandRow) brandRow.classList.remove('hidden');
+  updateLocationContext();
 }
 
 function saveAliasBook() {
@@ -782,6 +941,7 @@ function lockSession() {
   state.currentHome = null;
   state.didDocCache.clear();
   state.blockedDidRoots = new Set();
+  clearRoomPresence();
   byId('transcript').innerHTML = '';
   setSetupStatus('Session locked. Bundle remains stored unless removed manually.');
   showSetup();
@@ -1078,10 +1238,20 @@ function renderLocalBroadcastMessage(text) {
   appendMessage('world', humanizeText(`${actor}: ${text}`));
 }
 
-function updateRoomHeading(desc) {
-  const el = byId('room-heading');
-  if (!el) return;
-  el.textContent = (desc && desc.trim()) ? desc : (state.currentHome?.room || 'Welcome');
+function updateRoomHeading(title, desc) {
+  const heading = byId('room-heading');
+  const description = byId('room-description');
+  if (!heading || !description) return;
+
+  const resolvedTitle = String(title || '').trim()
+    || String(state.currentHome?.roomTitle || '').trim()
+    || humanRoomTitle(state.currentHome?.room || '');
+  const resolvedDescription = String(desc || '').trim()
+    || String(state.currentHome?.roomDescription || '').trim();
+
+  heading.textContent = resolvedTitle;
+  description.textContent = resolvedDescription;
+  updateLocationContext();
 }
 
 function applyWorldResponse(result) {
@@ -1090,13 +1260,35 @@ function applyWorldResponse(result) {
   }
 
   if (result.room) {
+    const previousRoom = state.currentHome.room;
     state.currentHome.room = result.room;
+    if (result.room_did) state.currentHome.roomDid = result.room_did;
+    if (result.room_title) state.currentHome.roomTitle = result.room_title;
+    if (typeof result.room_description === 'string') state.currentHome.roomDescription = result.room_description;
     saveLastRoom(state.currentHome.endpointId, result.room);
     updateIdentityLine();
-  }
-
-  if (result.room_description !== undefined) {
-    updateRoomHeading(result.room_description);
+    updateRoomHeading(state.currentHome.roomTitle || '', state.currentHome.roomDescription || '');
+    // Clear presence panel on room change and seed from server roster.
+    if (result.room !== previousRoom) {
+      clearRoomPresence();
+      if (Array.isArray(result.avatars) && result.avatars.length > 0) {
+        for (const avatar of result.avatars) {
+          const handle = String(avatar?.handle || '').trim();
+          if (handle) trackRoomPresence(handle, String(avatar?.did || ''));
+        }
+      } else {
+        // Fallback: seed with self only (snapshot push will fill the rest).
+        trackRoomPresence(state.currentHome.handle || state.aliasName, state.identity?.did || '');
+      }
+    }
+  } else if (result.room_description !== undefined || result.room_title !== undefined) {
+    if (typeof result.room_title === 'string' && result.room_title) {
+      state.currentHome.roomTitle = result.room_title;
+    }
+    if (typeof result.room_description === 'string') {
+      state.currentHome.roomDescription = result.room_description;
+    }
+    updateRoomHeading(state.currentHome.roomTitle || '', state.currentHome.roomDescription || '');
   }
 
   state.currentHome.lastEventSequence = toSequenceNumber(
@@ -1325,12 +1517,24 @@ async function enterHome(target, preferredRoom = null) {
     alias: findAliasForAddress(endpointId) || alias,
     endpointId,
     room: activeRoom,
+    roomTitle: result.room_title || humanRoomTitle(activeRoom),
+    roomDescription: result.room_description || '',
+    roomDid: result.room_did || '',
     lastEventSequence: toSequenceNumber(result.latest_event_sequence || 0),
     handle: result.handle || state.aliasName
   };
   saveLastRoom(endpointId, activeRoom);
+  clearRoomPresence();
+  if (Array.isArray(result.avatars) && result.avatars.length > 0) {
+    for (const avatar of result.avatars) {
+      const handle = String(avatar?.handle || '').trim();
+      if (handle) trackRoomPresence(handle, String(avatar?.did || ''));
+    }
+  } else {
+    trackRoomPresence(result.handle || state.aliasName, state.identity?.did || '');
+  }
   updateIdentityLine();
-  updateRoomHeading(result.room_description || activeRoom);
+  updateRoomHeading(state.currentHome.roomTitle, state.currentHome.roomDescription);
 
   await ensureInboxListener();
   updateIdentityLine();
@@ -1857,6 +2061,7 @@ function restoreSavedValues() {
 
 async function main() {
   await init();
+  applyProperName();
   restoreSavedValues();
 
   byId('btn-kubo-check').addEventListener('click', () => {

@@ -8,7 +8,8 @@ use chacha20poly1305::{
     Key, XChaCha20Poly1305, XNonce,
 };
 use did_ma::{
-    CONTENT_TYPE_CHAT, CONTENT_TYPE_CMD, CONTENT_TYPE_WORLD, CONTENT_TYPE_WHISPER,
+    CONTENT_TYPE_BROADCAST, CONTENT_TYPE_CHAT, CONTENT_TYPE_CMD, CONTENT_TYPE_PRESENCE,
+    CONTENT_TYPE_WORLD, CONTENT_TYPE_WHISPER,
     Did, Document, EncryptionKey, Message, SigningKey, VerificationMethod,
 };
 use iroh::{
@@ -117,55 +118,6 @@ fn recipient_inbox_endpoint_id(document: &Document) -> Result<String, JsValue> {
     }
 
     Err(js_err("recipient DID document has no usable inbox transport endpoint"))
-}
-
-async fn send_inbox_signed_message(target_endpoint_id: &str, message_cbor: Vec<u8>) -> Result<InboxResponse, JsValue> {
-    let target: EndpointId = target_endpoint_id
-        .trim()
-        .parse()
-        .map_err(|e| js_err(format!("invalid recipient endpoint id: {e}")))?;
-
-    let endpoint = Endpoint::builder(presets::N0)
-        .bind()
-        .await
-        .map_err(|e| js_err(format!("sender endpoint bind failed: {e}")))?;
-    let _ = endpoint.online().await;
-
-    let relay_source = normalize_relay_url(DEFAULT_WORLD_RELAY_URL);
-    let relay_url: RelayUrl = relay_source
-        .parse()
-        .map_err(|e| js_err(format!("relay URL parse failed for '{}': {}", relay_source, e)))?;
-
-    let endpoint_addr = EndpointAddr::new(target).with_relay_url(relay_url);
-    let connection = endpoint
-        .connect(endpoint_addr, INBOX_ALPN)
-        .await
-        .map_err(|e| js_err(format!("inbox endpoint.connect() failed: {}", e)))?;
-
-    let (mut send, mut recv) = connection
-        .open_bi()
-        .await
-        .map_err(|e| js_err(format!("inbox connection.open_bi() failed: {}", e)))?;
-
-    let request = InboxRequest::Signed { message_cbor };
-    let payload = serde_json::to_vec(&request).map_err(js_err)?;
-
-    send.write_u32(payload.len() as u32).await.map_err(js_err)?;
-    send.write_all(&payload).await.map_err(js_err)?;
-    send.flush().await.map_err(js_err)?;
-
-    let frame_len = recv.read_u32().await.map_err(js_err)? as usize;
-    if frame_len > 256 * 1024 {
-        return Err(js_err(format!("inbox response frame too large: {}", frame_len)));
-    }
-    let mut bytes = vec![0u8; frame_len];
-    recv.read_exact(&mut bytes).await.map_err(js_err)?;
-
-    let _ = send.finish();
-    connection.close(0u32.into(), b"ok");
-    endpoint.close().await;
-
-    serde_json::from_slice::<InboxResponse>(&bytes).map_err(js_err)
 }
 
 async fn send_whisper_signed_message(target_endpoint_id: &str, message_cbor: Vec<u8>) -> Result<InboxResponse, JsValue> {
@@ -309,19 +261,57 @@ impl ProtocolHandler for InboxProtocol {
 
             let response = match serde_json::from_slice::<InboxRequest>(&bytes) {
                 Ok(InboxRequest::Signed { message_cbor }) => {
-                    let item = InboxMessage {
-                        message_cbor_b64: B64.encode(message_cbor),
-                        from_endpoint: from_endpoint.clone(),
-                        received_at: now_unix_secs(),
-                    };
-                    let mut queue = self.queue.write().await;
-                    if queue.len() >= MAX_INBOX_EVENTS {
-                        queue.pop_front();
-                    }
-                    queue.push_back(item);
-                    InboxResponse {
-                        ok: true,
-                        message: "queued".to_string(),
+                    if let Some(expected) = self.expected_content_type {
+                        match Message::from_cbor(&message_cbor) {
+                            Ok(message) if message.content_type == expected => {
+                                let item = InboxMessage {
+                                    message_cbor_b64: B64.encode(message_cbor),
+                                    from_endpoint: from_endpoint.clone(),
+                                    received_at: now_unix_secs(),
+                                };
+                                let mut queue = self.queue.write().await;
+                                if queue.len() >= MAX_INBOX_EVENTS {
+                                    queue.pop_front();
+                                }
+                                queue.push_back(item);
+                                InboxResponse {
+                                    ok: true,
+                                    message: "queued".to_string(),
+                                }
+                            }
+                            Ok(message) => InboxResponse {
+                                ok: false,
+                                message: format!(
+                                    "{} expects content_type={} but got {}",
+                                    self.lane_label,
+                                    expected,
+                                    message.content_type
+                                ),
+                            },
+                            Err(err) => InboxResponse {
+                                ok: false,
+                                message: format!(
+                                    "invalid signed message on {}: {}",
+                                    self.lane_label,
+                                    err
+                                ),
+                            },
+                        }
+                    } else {
+                        let item = InboxMessage {
+                            message_cbor_b64: B64.encode(message_cbor),
+                            from_endpoint: from_endpoint.clone(),
+                            received_at: now_unix_secs(),
+                        };
+                        let mut queue = self.queue.write().await;
+                        if queue.len() >= MAX_INBOX_EVENTS {
+                            queue.pop_front();
+                        }
+                        queue.push_back(item);
+                        InboxResponse {
+                            ok: true,
+                            message: "queued".to_string(),
+                        }
                     }
                 }
                 Err(err) => InboxResponse {
@@ -355,14 +345,32 @@ async fn ensure_inbox_listener_with_secret(secret_key: SecretKey) -> Result<Stri
         .map_err(|e| js_err(format!("inbox endpoint bind failed: {e}")))?;
 
     let queue = Arc::new(RwLock::new(VecDeque::with_capacity(MAX_INBOX_EVENTS)));
-    let protocol = InboxProtocol {
+    let inbox_protocol = InboxProtocol {
         queue: queue.clone(),
+        expected_content_type: None,
+        lane_label: "ma/inbox/1",
+    };
+    let whisper_protocol = InboxProtocol {
+        queue: queue.clone(),
+        expected_content_type: Some(CONTENT_TYPE_WHISPER),
+        lane_label: "ma/whisper/1",
+    };
+    let broadcast_protocol = InboxProtocol {
+        queue: queue.clone(),
+        expected_content_type: Some(CONTENT_TYPE_BROADCAST),
+        lane_label: "ma/broadcast/1",
+    };
+    let presence_protocol = InboxProtocol {
+        queue: queue.clone(),
+        expected_content_type: Some(CONTENT_TYPE_PRESENCE),
+        lane_label: "ma/presence/1",
     };
 
     let router = Router::builder(endpoint.clone())
-        .accept(INBOX_ALPN, protocol.clone())
-        .accept(WHISPER_ALPN, protocol.clone())
-        .accept(BROADCAST_ALPN, protocol)
+        .accept(INBOX_ALPN, inbox_protocol)
+        .accept(WHISPER_ALPN, whisper_protocol)
+        .accept(BROADCAST_ALPN, broadcast_protocol)
+        .accept(PRESENCE_ALPN, presence_protocol)
         .spawn();
 
     let endpoint_id = endpoint.id().to_string();
@@ -487,6 +495,8 @@ use ma_actor::{
     normalize_endpoint_id as core_normalize_endpoint_id,
     parse_message_with_locale,
     resolve_alias_input as core_resolve_alias_input,
+    RoomEvent, WorldCommand, WorldRequest, WorldResponse,
+    BROADCAST_ALPN, CHAT_ALPN, CMD_ALPN, PRESENCE_ALPN, WORLD_ALPN,
 };
 use serde::{Deserialize, Serialize};
 use wasm_bindgen::prelude::*;
@@ -537,80 +547,18 @@ struct UpdateResult {
     document_json: String,
 }
 
-#[derive(Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-enum WorldRequest {
-    Signed { message_cbor: Vec<u8> },
-    Chat { room: String, message_cbor: Vec<u8> },
-    Whisper { message_cbor: Vec<u8> },
-}
-
-#[derive(Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-enum WorldCommand {
-    Enter { room: Option<String>, preferred_handle: Option<String> },
-    Message {
-        room: String,
-        envelope: ma_actor::MessageEnvelope,
-    },
-    RoomEvents {
-        room: String,
-        since_sequence: u64,
-    },
-}
-
-#[derive(Serialize, Deserialize)]
-struct RoomEvent {
-    sequence: u64,
-    room: String,
-    kind: String,
-    sender: Option<String>,
-    #[serde(default)]
-    sender_did: Option<String>,
-    #[serde(default)]
-    sender_endpoint: Option<String>,
-    message: String,
-    #[serde(default)]
-    message_cbor_b64: Option<String>,
-    occurred_at: String,
-}
-
-#[derive(Serialize, Deserialize)]
-struct WorldResponse {
-    ok: bool,
-    room: String,
-    message: String,
-    endpoint_id: String,
-    latest_event_sequence: u64,
-    broadcasted: bool,
-    events: Vec<RoomEvent>,
-    #[serde(default)]
-    handle: String,
-    #[serde(default)]
-    pending_whispers: Vec<RoomEvent>,
-}
-
+/// Client-side result wrapper that extends the shared WorldResponse with
+/// fields populated locally (e.g. pending whispers from the inbox).
 #[derive(Serialize)]
 struct WorldActionResult {
-    ok: bool,
-    room: String,
-    message: String,
-    endpoint_id: String,
-    latest_event_sequence: u64,
-    broadcasted: bool,
-    events: Vec<RoomEvent>,
-    #[serde(default)]
-    handle: String,
+    #[serde(flatten)]
+    response: WorldResponse,
     #[serde(default)]
     pending_whispers: Vec<RoomEvent>,
 }
 
-const WORLD_ALPN: &[u8] = b"ma/world/1";
-const CMD_ALPN: &[u8] = b"ma/cmd/1";
-const CHAT_ALPN: &[u8] = b"ma/chat/1";
 const INBOX_ALPN: &[u8] = b"ma/inbox/1";
 const WHISPER_ALPN: &[u8] = b"ma/whisper/1";
-const BROADCAST_ALPN: &[u8] = b"ma/broadcast/1";
 const WORLD_TARGET_DID: &str = "did:ma:world";
 const MAX_INBOX_EVENTS: usize = 256;
 
@@ -642,6 +590,8 @@ struct InboxResponse {
 #[derive(Clone, Debug)]
 struct InboxProtocol {
     queue: Arc<RwLock<VecDeque<InboxMessage>>>,
+    expected_content_type: Option<&'static str>,
+    lane_label: &'static str,
 }
 
 #[derive(Debug)]
@@ -963,12 +913,14 @@ pub fn inspect_signed_message(message_cbor_b64: &str) -> Result<String, JsValue>
         from: String,
         to: String,
         content_type: String,
+        content_text: String,
     }
 
     serde_json::to_string(&MessageMeta {
         from: message.from,
         to: message.to,
         content_type: message.content_type,
+        content_text: String::from_utf8_lossy(&message.content).to_string(),
     })
     .map_err(js_err)
 }
@@ -1435,15 +1387,8 @@ pub async fn enter_world(
     let response = send_world_request(endpoint_id, request).await?;
 
     serde_json::to_string(&WorldActionResult {
-        ok: response.ok,
-        room: response.room,
-        message: response.message,
-        endpoint_id: response.endpoint_id,
-        latest_event_sequence: response.latest_event_sequence,
-        broadcasted: response.broadcasted,
-        events: response.events,
-        handle: response.handle,
-        pending_whispers: response.pending_whispers,
+        response,
+        pending_whispers: vec![],
     })
     .map_err(js_err)
 }
@@ -1487,15 +1432,8 @@ pub async fn send_world_chat(
     let response = send_world_chat_request(endpoint_id, request).await?;
 
     serde_json::to_string(&WorldActionResult {
-        ok: response.ok,
-        room: response.room,
-        message: response.message,
-        endpoint_id: response.endpoint_id,
-        latest_event_sequence: response.latest_event_sequence,
-        broadcasted: response.broadcasted,
-        events: response.events,
-        handle: response.handle,
-        pending_whispers: response.pending_whispers,
+        response,
+        pending_whispers: vec![],
     })
     .map_err(js_err)
 }
@@ -1540,14 +1478,20 @@ pub async fn send_world_whisper(
     let response = send_whisper_signed_message(&recipient_endpoint_id, message.to_cbor().map_err(js_err)?).await?;
 
     serde_json::to_string(&WorldActionResult {
-        ok: response.ok,
-        room: String::new(),
-        message: response.message,
-        endpoint_id: recipient_endpoint_id,
-        latest_event_sequence: 0,
-        broadcasted: false,
-        events: Vec::new(),
-        handle: String::new(),
+        response: WorldResponse {
+            ok: response.ok,
+            room: String::new(),
+            message: response.message,
+            endpoint_id: recipient_endpoint_id,
+            latest_event_sequence: 0,
+            broadcasted: false,
+            events: Vec::new(),
+            handle: String::new(),
+            room_description: String::new(),
+            room_title: String::new(),
+            room_did: String::new(),
+            avatars: Vec::new(),
+        },
         pending_whispers: Vec::new(),
     })
     .map_err(js_err)
@@ -1624,15 +1568,8 @@ pub async fn send_world_message(
     let response = send_world_request(endpoint_id, request).await?;
 
     serde_json::to_string(&WorldActionResult {
-        ok: response.ok,
-        room: response.room,
-        message: response.message,
-        endpoint_id: response.endpoint_id,
-        latest_event_sequence: response.latest_event_sequence,
-        broadcasted: response.broadcasted,
-        events: response.events,
-        handle: response.handle,
-        pending_whispers: response.pending_whispers,
+        response,
+        pending_whispers: vec![],
     })
     .map_err(js_err)
 }
@@ -1671,15 +1608,8 @@ pub async fn send_world_cmd(
     let response = send_world_cmd_request(endpoint_id, request).await?;
 
     serde_json::to_string(&WorldActionResult {
-        ok: response.ok,
-        room: response.room,
-        message: response.message,
-        endpoint_id: response.endpoint_id,
-        latest_event_sequence: response.latest_event_sequence,
-        broadcasted: response.broadcasted,
-        events: response.events,
-        handle: response.handle,
-        pending_whispers: response.pending_whispers,
+        response,
+        pending_whispers: vec![],
     })
     .map_err(js_err)
 }
@@ -1709,15 +1639,8 @@ pub async fn poll_world_events(
     let response = send_world_request(endpoint_id, request).await?;
 
     serde_json::to_string(&WorldActionResult {
-        ok: response.ok,
-        room: response.room,
-        message: response.message,
-        endpoint_id: response.endpoint_id,
-        latest_event_sequence: response.latest_event_sequence,
-        broadcasted: response.broadcasted,
-        events: response.events,
-        handle: response.handle,
-        pending_whispers: response.pending_whispers,
+        response,
+        pending_whispers: vec![],
     })
     .map_err(js_err)
 }

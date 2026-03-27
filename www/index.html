@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>ma home</title>
+  <title>間</title>
   <link rel="stylesheet" href="style.css">
 </head>
 <body>
@@ -11,9 +11,14 @@
 
   <main class="shell">
     <header class="brand-row">
-      <h1>ma home</h1>
-      <p>portable encrypted identity over IPFS and IPNS</p>
+      <h1 id="brand-proper-name">間</h1>
+      <p id="brand-subtitle">間 — identity, presence, and transport</p>
     </header>
+
+    <div id="session-tools" class="session-tools hidden" aria-label="Session tools">
+      <button id="btn-export" type="button">Export Bundle</button>
+      <button id="btn-lock" type="button">Lock</button>
+    </div>
 
     <section id="setup-view" class="card">
       <h2>Create or provide identity</h2>
@@ -70,23 +75,24 @@
     </section>
 
     <section id="chat-view" class="chat hidden" aria-live="polite">
-      <div class="chat-top">
-        <div>
-          <h2 id="room-heading">Welcome</h2>
-          <p class="lead" id="identity-line"></p>
-        </div>
-        <div class="chat-tools">
-          <button id="btn-export" type="button">Export Bundle</button>
-          <button id="btn-lock" type="button">Lock</button>
-        </div>
+      <div class="room-hero">
+        <h2 id="room-heading">Welcome</h2>
+        <p class="lead room-description" id="room-description"></p>
       </div>
 
-      <div id="transcript" class="transcript"></div>
-
-      <form id="command-form" class="composer">
-        <input id="command-input" type="text" placeholder="Type a command, for example alias home /iroh/... or /enter home" autocomplete="off">
-        <button type="submit" class="primary">Send</button>
-      </form>
+      <div class="chat-body">
+        <div class="chat-main">
+          <div id="transcript" class="transcript"></div>
+          <form id="command-form" class="composer">
+            <input id="command-input" type="text" placeholder="Type a command, for example alias home /iroh/... or /enter home" autocomplete="off">
+            <button type="submit" class="primary">Send</button>
+          </form>
+        </div>
+        <aside id="avatar-panel" class="avatar-panel">
+          <div class="avatar-panel-label">Here</div>
+          <ul id="avatar-list"></ul>
+        </aside>
+      </div>
     </section>
   </main>
 

@@ -6,6 +6,9 @@ export function contentTypeToRouteKey(contentType) {
   if (value === 'application/x-ma-whisper' || value === 'application/x.ma.whisper') {
     return 'application/x-ma-whisper';
   }
+  if (value === 'application/x-ma-presence' || value === 'application/x.ma.presence') {
+    return 'application/x-ma-presence';
+  }
   return '';
 }
 
@@ -19,6 +22,7 @@ export function createInboundDispatcher(deps) {
     fetchDidDocumentJsonByDid,
     decodeChatEventMessage,
     decodeWhisperEventMessage,
+    onPresenceEvent,
     didRoot
   } = deps;
 
@@ -143,9 +147,29 @@ export function createInboundDispatcher(deps) {
     writeDialogWorld(evt.text);
   }
 
+  async function handleInboundPresence(evt) {
+    const expectedRoomDid = state.currentHome?.roomDid;
+    if (!expectedRoomDid || evt.senderDid !== expectedRoomDid) {
+      logger.log('inbox.presence', `dropped presence from unexpected sender ${evt.senderDid || '(none)'} (expected room did ${expectedRoomDid || 'none'})`);
+      return;
+    }
+    if (!evt.text) return;
+    let payload;
+    try {
+      payload = JSON.parse(evt.text);
+    } catch (error) {
+      logger.log('inbox.presence', `invalid presence payload json: ${error instanceof Error ? error.message : String(error)}`);
+      return;
+    }
+    if (typeof onPresenceEvent === 'function') {
+      await onPresenceEvent(payload, evt);
+    }
+  }
+
   const inboundRoutes = {
     'application/x-ma-chat': { name: 'chat', handler: handleInboundChat },
     'application/x-ma-whisper': { name: 'whisper', handler: handleInboundWhisper },
+    'application/x-ma-presence': { name: 'presence', handler: handleInboundPresence },
     'event/system': { name: 'system', handler: handleInboundSystem },
     'event/speech': { name: 'speech', handler: handleInboundSpeech },
     'event/default': { name: 'default', handler: handleInboundDefault }

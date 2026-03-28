@@ -60,11 +60,15 @@ make distclean
 - `/help`
 - `/identity`
 - `/alias <name> <address>`
-- `alias <name> <address>`
 - `/unalias <name>`
 - `/aliases`
+- `/locale <tag>` (also `/lang`, `/language`)
 - `/enter </iroh/...|alias>`
 - `/publish` (publishes DID document to IPNS)
+- `/block <did|alias|handle>`
+- `/unblock <did|alias|handle>`
+- `/blocks`
+- `/smoke [alias]` (diagnostic smoke test)
 
 ## Home Entry Over Iroh
 
@@ -99,6 +103,18 @@ The localhost status page in `ma-world` is still useful for inspection, but it i
 
 Browser calls require Kubo API CORS headers allowing your app origin (for example `http://127.0.0.1:8081`).
 
+## Protocol & Transport
+
+The WASM client uses ALPN constants and content types from `did-ma` directly
+(e.g. `CONTENT_TYPE_CHAT`, `CONTENT_TYPE_PRESENCE`, `CONTENT_TYPE_WHISPER`, `CONTENT_TYPE_BROADCAST`).
+Connection caches are maintained per transport kind (World, Cmd, Chat) so
+repeated interactions with the same world reuse the iroh connection.
+
+An inbox listener registers protocol handlers for the `ma/inbox/1`,
+`ma/whisper/1`, `ma/broadcast/1`, and `ma/presence/1` ALPN lanes so the
+browser can receive inbound signed messages (presence snapshots, whispers,
+broadcasts) from the world and other actors.
+
 If `/publish` or Kubo check fails in-browser, verify:
 
 1. Kubo daemon is running
@@ -107,4 +123,3 @@ If `/publish` or Kubo check fails in-browser, verify:
 
 Local serving on `http://127.0.0.1:8081` remains the recommended runtime origin.
 Use `make publish-ipfs` for distribution and archival, not as the primary runtime origin.
-

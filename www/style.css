@@ -192,7 +192,76 @@ button.primary {
 }
 
 .hidden {
-  display: none;
+  display: none !important;
+}
+
+.lock-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 50;
+  display: grid;
+  place-items: center;
+  padding: 0;
+  background: radial-gradient(circle at 18% 12%, rgba(98, 217, 255, 0.24), transparent 38%),
+              radial-gradient(circle at 84% 86%, rgba(154, 111, 255, 0.28), transparent 42%),
+              radial-gradient(circle at 48% 42%, rgba(26, 74, 124, 0.3), transparent 56%),
+              linear-gradient(160deg, rgba(4, 15, 32, 0.9), rgba(9, 24, 43, 0.86));
+  backdrop-filter: blur(7px);
+}
+
+.lock-card {
+  position: relative;
+  width: 100vw;
+  height: 100vh;
+  border: 0;
+  border-radius: 0;
+  padding: 0;
+  background: transparent;
+  box-shadow: none;
+  color: #e8f3fb;
+  overflow: hidden;
+}
+
+.lock-banner {
+  position: absolute;
+  top: clamp(0.9rem, 2.8vh, 2rem);
+  left: clamp(0.9rem, 2.8vw, 2.2rem);
+  z-index: 2;
+  display: flex;
+  justify-content: flex-start;
+  align-items: center;
+  gap: 0.6rem;
+  margin-bottom: 0;
+  max-width: min(92vw, 760px);
+  padding: 0.62rem 0.85rem;
+  border-radius: 12px;
+  border: 1px solid rgba(177, 225, 255, 0.32);
+  background: linear-gradient(160deg, rgba(8, 24, 48, 0.62), rgba(9, 23, 56, 0.52));
+  backdrop-filter: blur(4px);
+}
+
+.lock-title {
+  margin: 0;
+  font-family: "Iowan Old Style", "Palatino Linotype", serif;
+  font-size: clamp(1.2rem, 3.5vw, 2rem);
+  letter-spacing: 0.015em;
+  color: #f2fbff;
+  text-shadow: 0 2px 16px rgba(78, 196, 255, 0.35);
+}
+
+.lock-subtitle {
+  margin: 0.32rem 0 0;
+  color: #d3ebff;
+  font-size: clamp(0.88rem, 1.8vw, 1rem);
+}
+
+.lock-canvas {
+  width: 100%;
+  height: 100%;
+  border-radius: 0;
+  display: block;
+  border: 0;
+  background: #071425;
 }
 
 .room-hero h2 {
@@ -345,6 +414,24 @@ button.primary {
 
   .chat-body {
     grid-template-columns: 1fr;
+  }
+
+  .lock-card {
+    border-radius: 0;
+    padding: 0;
+  }
+
+  .lock-banner {
+    left: 0.65rem;
+    top: 0.65rem;
+    max-width: calc(100vw - 1.3rem);
+    flex-direction: row;
+    align-items: flex-start;
+    padding: 0.5rem 0.65rem;
+  }
+
+  .lock-canvas {
+    height: 100%;
   }
 
   #avatar-list {

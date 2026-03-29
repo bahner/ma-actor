@@ -64,6 +64,7 @@ make distclean
 - `/aliases`
 - `/locale <tag>` (also `/lang`, `/language`)
 - `/enter </iroh/...|alias>`
+- `/refresh` (force immediate room/object/event refresh)
 - `/publish` (publishes DID document to IPNS)
 - `/block <did|alias|handle>`
 - `/unblock <did|alias|handle>`

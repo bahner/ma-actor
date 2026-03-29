@@ -1763,6 +1763,7 @@ function parseSlash(input) {
     appendMessage('system', '  /unalias <name>            - remove a saved alias');
     appendMessage('system', '  /aliases                   - list saved aliases');
     appendMessage('system', '  /enter </ma-iroh/...|/iroh/...|alias> - enter a home by endpoint id or alias');
+    appendMessage('system', '  /refresh                   - fetch latest room state and events now');
     appendMessage('system', '  /smoke [alias]             - run enter + send + poll smoke test');
     appendMessage('system', '  /locale <en|nb-NO>         - change actor language for this alias');
     appendMessage('system', '  /publish                   - publish DID document to IPNS');
@@ -1961,6 +1962,21 @@ function parseSlash(input) {
     enterHome(rest[0]).catch((err) => {
       appendMessage('system', `Enter failed: ${err instanceof Error ? err.message : String(err)}`);
     });
+    return true;
+  }
+
+  if (cmd === '/refresh') {
+    if (!state.currentHome) {
+      appendMessage('system', 'Not connected to a home. Use /enter first.');
+      return true;
+    }
+    Promise.resolve()
+      .then(() => pollDirectInbox())
+      .then(() => pollCurrentHomeEvents())
+      .then(() => appendMessage('system', 'Refreshed room state.'))
+      .catch((err) => {
+        appendMessage('system', `Refresh failed: ${err instanceof Error ? err.message : String(err)}`);
+      });
     return true;
   }
 

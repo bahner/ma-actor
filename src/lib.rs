@@ -991,13 +991,21 @@ fn build_signed_world_request(
         .and_then(|did| did.with_fragment(actor_name))
         .map_err(js_err)?;
 
+    let target_world_did = plain
+        .document
+        .ma
+        .as_ref()
+        .and_then(|ma| ma.world.clone())
+        .filter(|did| Did::validate(did).is_ok())
+        .unwrap_or_else(|| WORLD_TARGET_DID.to_string());
+
     let signing_key = restore_signing_key(&plain.ipns, &plain.signing_private_key_hex)?;
     let content = serde_json::to_vec(&command).map_err(js_err)?;
     
     // Create message with custom timestamp from JavaScript (in milliseconds, convert to seconds)
     let message = build_signed_message_with_js_time(
         from_did.id().to_string(),
-        WORLD_TARGET_DID.to_string(),
+        target_world_did,
         content_type.to_string(),
         content,
         &signing_key,
